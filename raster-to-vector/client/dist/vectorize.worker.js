@@ -23,7 +23,10 @@ self.onmessage = async function (e) {
 
   if (msg.type === "init") {
     try {
-      self.postMessage({ type: "progress", message: "Loading Python runtime…" });
+      self.postMessage({
+        type: "progress",
+        message: "Loading Python runtime…",
+      });
       importScripts(PYODIDE_CDN + "pyodide.js");
 
       pyodide = await loadPyodide({ indexURL: PYODIDE_CDN });
@@ -34,7 +37,10 @@ self.onmessage = async function (e) {
       self.postMessage({ type: "progress", message: "Installing scipy…" });
       await pyodide.loadPackage("scipy");
 
-      self.postMessage({ type: "progress", message: "Installing scikit-image…" });
+      self.postMessage({
+        type: "progress",
+        message: "Installing scikit-image…",
+      });
       await pyodide.loadPackage("scikit-image");
 
       self.postMessage({ type: "progress", message: "Installing OpenCV…" });
@@ -58,7 +64,7 @@ self.onmessage = async function (e) {
       }
 
       await pyodide.runPythonAsync(
-        "import sys; sys.path.insert(0, '/home/pyodide')"
+        "import sys; sys.path.insert(0, '/home/pyodide')",
       );
       await pyodide.runPythonAsync("import vectorize_entry");
 
@@ -92,7 +98,7 @@ self.onmessage = async function (e) {
           "    crop_x=int(_crop_x), crop_y=int(_crop_y),\n" +
           "    crop_w=int(_crop_w), crop_h=int(_crop_h),\n" +
           "    remove_bg=bool(_rm_bg), num_levels=int(_levels),\n" +
-          ")"
+          ")",
       );
 
       var result = JSON.parse(resultJson);

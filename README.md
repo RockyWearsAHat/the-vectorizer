@@ -43,9 +43,8 @@ Open **http://localhost:5173** and upload an image.
 
 ### GitHub Pages Demo
 
-Visit the [live demo](https://alexwaldmann.github.io/SVG-gen/) — you'll
-need to run the backend locally (step 2 above) for it to work. The frontend
-connects to `http://127.0.0.1:8100`.
+Visit the [live demo](https://rockywearsahat.github.io/the-vectorizer/) —
+everything runs in-browser via Pyodide (Python→WebAssembly). No backend needed.
 
 ## How It Works
 

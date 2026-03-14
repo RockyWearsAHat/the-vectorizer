@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
-  base: process.env.VITE_GITHUB_PAGES ? "/SVG-gen/" : "/",
+  base: process.env.VITE_GITHUB_PAGES ? "/the-vectorizer/" : "/",
   server: {
     port: 5173,
     proxy: {
