@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/vite-env.d.ts","./src/app/app.tsx","./src/features/comparison/comparisonview.tsx","./src/features/export/exportbutton.tsx","./src/features/preview/vectorpreview.tsx","./src/features/selection/regionselector.tsx","./src/features/upload/imageupload.tsx","./src/hooks/useasync.ts","./src/utils/api.ts"],"version":"5.7.3"}
