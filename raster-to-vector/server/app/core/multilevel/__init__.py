@@ -107,8 +107,8 @@ def multilevel_vectorize(
     image_bgr: np.ndarray,
     *,
     num_levels: int = 24,
-    simplify_epsilon: float = 0.08,
-    max_error: float = 0.25,
+    simplify_epsilon: float = 0.05,
+    max_error: float = 0.20,
     line_tolerance: float = 0.25,
     corner_threshold: float = 60.0,
     min_contour_area: int = 1,
@@ -367,7 +367,20 @@ def multilevel_vectorize(
                 continue
             xy = contour[:, ::-1].astype(np.float64)
 
-            xy = _smooth_contour(xy, sigma=0.65 * S)
+            # Width-aware smoothing: measure the contour's local width
+            # via its area/perimeter ratio.  Thick shapes (letter bodies)
+            # get full smoothing for clean edges.  Thin strokes (serifs,
+            # crossbars) get much lighter smoothing so they don't wobble.
+            perim = float(np.sum(np.sqrt(np.sum(np.diff(xy, axis=0)**2, axis=1))))
+            raw_area = abs(_polygon_area(xy))
+            width_est = (raw_area / perim) if perim > 1e-6 else 0.0
+            # width_est is ~half-width in upscaled pixels.
+            # thin (<1.5*S): sigma scales down to 0.25*S
+            # thick (>3*S):  sigma caps at 0.65*S
+            t = min(max((width_est - 1.5 * S) / (1.5 * S), 0.0), 1.0)
+            contour_sigma = (0.25 + t * 0.40) * S
+
+            xy = _smooth_contour(xy, sigma=contour_sigma)
             xy = xy / S
             area = abs(_polygon_area(xy))
             if area < min_contour_area:
