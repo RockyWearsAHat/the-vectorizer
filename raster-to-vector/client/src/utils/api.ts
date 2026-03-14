@@ -1,5 +1,7 @@
-const IS_PAGES = import.meta.env.VITE_GITHUB_PAGES === "true";
-const API_BASE = IS_PAGES ? "http://127.0.0.1:8100/api" : "/api";
+import { uploadImageLocal, vectorizeLocal } from "./pyodide-api";
+
+export const IS_PAGES = import.meta.env.VITE_GITHUB_PAGES === "true";
+const API_BASE = IS_PAGES ? "" : "/api";
 
 export interface UploadResponse {
   image_id: string;
@@ -37,6 +39,8 @@ export interface ResultResponse {
 }
 
 export async function uploadImage(file: File): Promise<UploadResponse> {
+  if (IS_PAGES) return uploadImageLocal(file);
+
   const form = new FormData();
   form.append("file", file);
   const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: form });
@@ -57,6 +61,8 @@ export interface VectorizeParams {
 export async function vectorize(
   params: VectorizeParams,
 ): Promise<VectorizeResponse> {
+  if (IS_PAGES) return vectorizeLocal(params);
+
   const form = new FormData();
   form.append("image_id", params.image_id);
   form.append("crop_x", String(params.crop_x ?? 0));

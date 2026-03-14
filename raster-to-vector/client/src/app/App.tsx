@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { ImageUpload } from "../features/upload/ImageUpload";
 import {
   RegionSelector,
@@ -8,14 +8,31 @@ import { VectorPreview } from "../features/preview/VectorPreview";
 import { ComparisonView } from "../features/comparison/ComparisonView";
 import { ExportButton } from "../features/export/ExportButton";
 import {
+  IS_PAGES,
   type UploadResponse,
   type VectorizeResponse,
   type CompareResponse,
   vectorize,
   compareImages,
 } from "../utils/api";
+import { initPyodide } from "../utils/pyodide-api";
 
 export function App() {
+  // Pyodide loading state (Pages mode only)
+  const [pyodideReady, setPyodideReady] = useState(!IS_PAGES);
+  const [pyodideProgress, setPyodideProgress] = useState<string | null>(null);
+  const [pyodideError, setPyodideError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!IS_PAGES) return;
+    initPyodide((msg) => setPyodideProgress(msg))
+      .then(() => {
+        setPyodideReady(true);
+        setPyodideProgress(null);
+      })
+      .catch((err) => setPyodideError(String(err)));
+  }, []);
+
   // Image state
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -94,8 +111,27 @@ export function App() {
         </p>
       </header>
 
+      {/* Pyodide loading (Pages mode) */}
+      {IS_PAGES && !pyodideReady && !pyodideError && (
+        <div className="border border-blue-500/30 bg-blue-500/10 rounded-xl p-6 text-center space-y-2">
+          <div className="inline-block w-6 h-6 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+          <p className="text-blue-300 text-sm">
+            {pyodideProgress ?? "Initializing…"}
+          </p>
+          <p className="text-gray-500 text-xs">
+            First load downloads ~30 MB of Python packages (cached after)
+          </p>
+        </div>
+      )}
+
+      {pyodideError && (
+        <div className="border border-red-500/30 bg-red-500/10 rounded-xl p-6 text-center">
+          <p className="text-red-400 text-sm">Failed to load: {pyodideError}</p>
+        </div>
+      )}
+
       {/* Upload */}
-      {!uploadResult && <ImageUpload onUpload={handleUpload} />}
+      {!uploadResult && pyodideReady && <ImageUpload onUpload={handleUpload} />}
 
       {/* Workspace */}
       {uploadResult && previewUrl && (
@@ -140,7 +176,7 @@ export function App() {
               Remove Background
             </label>
 
-            {vectorResult && (
+            {vectorResult && !IS_PAGES && (
               <button
                 onClick={handleCompare}
                 disabled={comparing}
