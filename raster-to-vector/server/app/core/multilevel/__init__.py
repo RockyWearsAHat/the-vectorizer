@@ -113,7 +113,7 @@ def multilevel_vectorize(
     corner_threshold: float = 60.0,
     min_contour_area: int = 1,
     contour_scale: int = 6,
-    smooth_sigma: float = 0.5,
+    smooth_sigma: float = 0.7,
 ) -> MultilevelResult:
     h, w = image_bgr.shape[:2]
 
@@ -356,7 +356,7 @@ def multilevel_vectorize(
         mx = grad.max()
         grad_norm = grad / mx if mx > 0 else grad
 
-        inner_iso, outer_iso = 0.55, 0.30
+        inner_iso, outer_iso = 0.60, 0.30
         adaptive_iso = outer_iso + grad_norm * (inner_iso - outer_iso)
         adaptive_iso = cv2.GaussianBlur(adaptive_iso, (0, 0), sigmaX=1.0 * S)
         shifted = soft - adaptive_iso
