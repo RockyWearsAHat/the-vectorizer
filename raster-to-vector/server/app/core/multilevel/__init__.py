@@ -109,7 +109,7 @@ def multilevel_vectorize(
     num_levels: int = 24,
     simplify_epsilon: float = 0.08,
     max_error: float = 0.20,
-    line_tolerance: float = 0.50,
+    line_tolerance: float = 0.25,
     corner_threshold: float = 60.0,
     min_contour_area: int = 1,
     contour_scale: int = 6,
@@ -356,7 +356,7 @@ def multilevel_vectorize(
         mx = grad.max()
         grad_norm = grad / mx if mx > 0 else grad
 
-        inner_iso, outer_iso = 0.60, 0.30
+        inner_iso, outer_iso = 0.55, 0.30
         adaptive_iso = outer_iso + grad_norm * (inner_iso - outer_iso)
         adaptive_iso = cv2.GaussianBlur(adaptive_iso, (0, 0), sigmaX=1.0 * S)
         shifted = soft - adaptive_iso
@@ -668,7 +668,7 @@ def _fit_contour(
     simplify_epsilon: float,
     max_error: float,
     corner_threshold: float,
-    line_tolerance: float = 0.50,
+    line_tolerance: float = 0.25,
 ) -> str:
     """Simplify contour and fit smooth closed Bézier curves; return SVG path d."""
     simplified = cv2.approxPolyDP(
