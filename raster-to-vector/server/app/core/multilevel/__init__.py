@@ -107,13 +107,13 @@ def multilevel_vectorize(
     image_bgr: np.ndarray,
     *,
     num_levels: int = 24,
-    simplify_epsilon: float = 0.12,
-    max_error: float = 0.30,
+    simplify_epsilon: float = 0.08,
+    max_error: float = 0.25,
     line_tolerance: float = 0.25,
     corner_threshold: float = 60.0,
     min_contour_area: int = 1,
-    contour_scale: int = 6,
-    smooth_sigma: float = 0.7,
+    contour_scale: int = 12,
+    smooth_sigma: float = 0.50,
 ) -> MultilevelResult:
     h, w = image_bgr.shape[:2]
 
@@ -126,15 +126,11 @@ def multilevel_vectorize(
     # --- Step 0: Edge-density map for adaptive processing ---
     edge_weight = _compute_edge_weight(image_bgr)
 
-    # --- Step 0b: Dual-denoise strategy ---
-    # SD images have subtle per-pixel static (3-8 BGR units of noise)
-    # within flat regions.  Two bilateral passes with different roles:
-    #   1. Strong spatial + medium color for K-means input → clean
-    #      cluster centres that aren't split by noise.
-    #   2. Mild spatial + very tight color gate (sc=5) for the distance
-    #      map → kills SD static in flat fills while leaving real edges
-    #      (20+ BGR difference) completely untouched.
+    # --- Step 0b: Dual denoise ------------------------------------------------
+    # Bilateral keeps edges while killing SD/AI per-pixel noise in flat regions.
+    # K-means input: generous spatial reach so cluster centres ignore noise.
     denoised_km = cv2.bilateralFilter(image_bgr, 15, 12, 30)
+    # Distance-map input: tighter to preserve fine colour gradients.
     denoised_dist = cv2.bilateralFilter(image_bgr, 7, 5, 20)
 
     # --- Step 1: K-means colour quantization ---
@@ -343,54 +339,19 @@ def multilevel_vectorize(
         # Edge-rich pixels get crisp sigma; flat fills get heavier
         # smoothing.  Mediator clusters use tighter smoothing so
         # their contours hug actual pixel locations.
-        sigma_crisp = (0.35 - mediator * 0.15) * S
-        sigma_smooth = (1.0 - mediator * 0.5) * S
+        sigma_crisp = (0.30 - mediator * 0.10) * S
+        sigma_smooth = (0.55 - mediator * 0.25) * S
         soft_crisp = cv2.GaussianBlur(soft_up, (0, 0), sigmaX=sigma_crisp)
         soft_smooth = cv2.GaussianBlur(soft_up, (0, 0), sigmaX=sigma_smooth)
         soft = ew_up * soft_crisp + (1.0 - ew_up) * soft_smooth
 
-        # --- Adaptive iso boundary placement ---
-        gx = cv2.Sobel(soft.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(soft.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
-        grad = np.sqrt(gx * gx + gy * gy)
-        mx = grad.max()
-        grad_norm = grad / mx if mx > 0 else grad
-
-        inner_iso, outer_iso = 0.60, 0.30
-        adaptive_iso = outer_iso + grad_norm * (inner_iso - outer_iso)
-        adaptive_iso = cv2.GaussianBlur(adaptive_iso, (0, 0), sigmaX=1.0 * S)
-        shifted = soft - adaptive_iso
-
-        layer_paths: list[str] = []
-        layer_opacities: list[float] = []
-
-        # --- Halo: soft AA fringe ---
-        halo_iso = 0.28
-        base_halo_opacity = 0.40
-        halo_opacity = base_halo_opacity * float((1.0 - lightness) ** 1.0)
-        halo_contours = find_contours(soft, halo_iso) if halo_opacity > 0.03 else []
-        halo_parts: list[str] = []
-        for contour in halo_contours:
-            if len(contour) < 4:
-                continue
-            xy = contour[:, ::-1].astype(np.float64)
-            xy = _smooth_contour(xy, sigma=smooth_sigma * 1.5 * S)
-            xy = xy / S
-            area = abs(_polygon_area(xy))
-            if area < min_contour_area:
-                continue
-            d = _fit_contour(xy, simplify_epsilon, max_error, corner_threshold, line_tolerance)
-            if d:
-                halo_parts.append(d)
-
-        if halo_parts:
-            combined = " ".join(halo_parts)
-            layer_paths.append(combined)
-            layer_opacities.append(halo_opacity)
-            total_paths += 1
-            total_nodes += combined.count("C") + combined.count("L") + combined.count("M")
+        # Simple flat iso — adaptive iso crushes thin features by pushing
+        # the threshold too high inside narrow strokes.
+        shifted = soft - 0.37
 
         # --- Core contour at adaptive iso, FULL opacity ---
+        layer_paths: list[str] = []
+        layer_opacities: list[float] = []
         # Fill tiny gaps in narrow features (e.g. thin letter legs)
         # Use minimal 3x3 kernel to avoid inflating junctions.
         if mediator < 0.3:
@@ -405,7 +366,8 @@ def multilevel_vectorize(
             if len(contour) < 4:
                 continue
             xy = contour[:, ::-1].astype(np.float64)
-            xy = _smooth_contour(xy, sigma=smooth_sigma * S)
+
+            xy = _smooth_contour(xy, sigma=0.65 * S)
             xy = xy / S
             area = abs(_polygon_area(xy))
             if area < min_contour_area:
@@ -470,12 +432,13 @@ def generate_svg(
             if opacity >= 1.0:
                 parts.append(
                     f'<path d="{path_d}" fill="{layer.color}"'
-                    f' fill-rule="evenodd"/>'
+                    f' fill-rule="evenodd" shape-rendering="geometricPrecision"/>'
                 )
             else:
                 parts.append(
                     f'<path d="{path_d}" fill="{layer.color}"'
-                    f' fill-rule="evenodd" opacity="{opacity:.2f}"/>'
+                    f' fill-rule="evenodd" opacity="{opacity:.2f}"'
+                    f' shape-rendering="geometricPrecision"/>'
                 )
 
     # Render stroke paths on top of fills
@@ -668,7 +631,7 @@ def _fit_contour(
     simplify_epsilon: float,
     max_error: float,
     corner_threshold: float,
-    line_tolerance: float = 0.25,
+    line_tolerance: float = 0.15,
 ) -> str:
     """Simplify contour and fit smooth closed Bézier curves; return SVG path d."""
     simplified = cv2.approxPolyDP(

@@ -156,6 +156,9 @@ def _fit_cubic_bezier(
     error, split_idx = _compute_max_error(points, seg, t_params)
 
     if error <= max_error:
+        # Post-fit check: convert near-straight Bézier to true line
+        if _is_near_straight(seg, line_tolerance):
+            return [_line_to_bezier(seg.p0, seg.p3)]
         return [seg]
 
     # Newton-Raphson reparameterization: refine t_params to reduce error
@@ -166,6 +169,8 @@ def _fit_cubic_bezier(
             seg = _fit_single_bezier(points, t_params, t_hat1, t_hat2)
             error, split_idx = _compute_max_error(points, seg, t_params)
             if error <= max_error:
+                if _is_near_straight(seg, line_tolerance):
+                    return [_line_to_bezier(seg.p0, seg.p3)]
                 return [seg]
 
     # Ensure valid split index
@@ -295,6 +300,18 @@ def _compute_max_error(
             split_idx = i
 
     return max_err, split_idx
+
+
+def _is_near_straight(seg: BezierSegment, tol: float) -> bool:
+    """Check if a cubic Bézier's control points are within tol of the chord."""
+    d = seg.p3 - seg.p0
+    chord_len = np.linalg.norm(d)
+    if chord_len < 1e-10:
+        return True
+    n = np.array([-d[1], d[0]]) / chord_len
+    d1 = abs(float(np.dot(seg.p1 - seg.p0, n)))
+    d2 = abs(float(np.dot(seg.p2 - seg.p0, n)))
+    return max(d1, d2) <= tol
 
 
 def _line_to_bezier(p0: np.ndarray, p1: np.ndarray) -> BezierSegment:

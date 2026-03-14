@@ -86,11 +86,11 @@ def multilevel_vectorize(
     num_levels: int = 24,
     simplify_epsilon: float = 0.12,
     max_error: float = 0.30,
-    line_tolerance: float = 0.25,
+    line_tolerance: float = 0.15,
     corner_threshold: float = 60.0,
     min_contour_area: int = 1,
     contour_scale: int = 6,
-    smooth_sigma: float = 0.7,
+    smooth_sigma: float = 0.85,
 ) -> MultilevelResult:
     h, w = image_bgr.shape[:2]
 
@@ -516,7 +516,7 @@ def _fit_contour(
     simplify_epsilon: float,
     max_error: float,
     corner_threshold: float,
-    line_tolerance: float = 0.25,
+    line_tolerance: float = 0.15,
 ) -> str:
     simplified = cv2.approxPolyDP(
         contour.reshape(-1, 1, 2).astype(np.float32),
