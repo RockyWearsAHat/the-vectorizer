@@ -1,3 +1,27 @@
-node_modules
+node_modules/
 .DS_Store
-.venv
+.venv/
+
+**/__pycache__/
+*.py[cod]
+
+# Generated outputs
+_comparisons/
+_comparisons_baseline/
+/*_output.svg
+/*_render.png
+/*_comparison.png
+/*_comparison_small.png
+/*_comparison_sm.png
+/*_comparison_sm.jpg
+/*_comp_tiny.jpg
+
+# Test images (large binaries)
+test1.jpg
+test2.jpg
+test3.jpg
+test4.jpg
+test5.jpg
+
+# IDE / tool config
+.vscode/mcp.json

@@ -13,7 +13,7 @@ from ..schemas import (
     CompareResponse,
     ComparisonMetrics,
 )
-from ..core.multilevel import multilevel_vectorize, generate_svg
+from ..core.multilevel import multilevel_vectorize, generate_svg, optimize_svg_colors
 from ..core.comparison import compare
 
 router = APIRouter()
@@ -79,7 +79,9 @@ async def vectorize_endpoint(
     )
 
     svg = generate_svg(result, remove_background=remove_background)
+    svg = optimize_svg_colors(svg, region)
     comparison_svg = generate_svg(result, remove_background=False)
+    comparison_svg = optimize_svg_colors(comparison_svg, region)
     comp = compare(region, comparison_svg)
 
     metrics = ComparisonMetrics(

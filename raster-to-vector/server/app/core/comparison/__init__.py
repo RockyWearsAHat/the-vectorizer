@@ -89,13 +89,19 @@ def compare(
 
 
 def _rasterize_svg(svg_string: str, width: int, height: int) -> np.ndarray:
-    """Rasterize an SVG string to a grayscale numpy array at the given dimensions."""
-    # Render with white background
+    """Rasterize an SVG string to a grayscale numpy array at the given dimensions.
+
+    Renders at 2× resolution and downscales with INTER_AREA to produce
+    natural anti-aliased edges that match the reference raster's AA.
+    """
+    scale = 2
     png_bytes = cairosvg.svg2png(
         bytestring=svg_string.encode("utf-8"),
-        output_width=width,
-        output_height=height,
+        output_width=width * scale,
+        output_height=height * scale,
         background_color="white",
     )
-    img = Image.open(io.BytesIO(png_bytes)).convert("L")
-    return np.array(img)
+    img = np.array(Image.open(io.BytesIO(png_bytes)).convert("L"))
+    if scale > 1:
+        img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+    return img
