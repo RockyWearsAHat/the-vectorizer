@@ -1,0 +1,13 @@
+{
+  "terminal.integrated.env.osx": {
+    "DYLD_LIBRARY_PATH": "/opt/homebrew/opt/cairo/lib"
+  },
+  "github.copilot.chat.agent.autoApprove": [
+    "python compare_all.py",
+    "python compare_all.py --full",
+    "python check_regression.py",
+    "python generate.py *",
+    "python _inspect_closeup.py *",
+    "source raster-to-vector/server/.venv/bin/activate"
+  ]
+}
