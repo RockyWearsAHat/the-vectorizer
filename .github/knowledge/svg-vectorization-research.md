@@ -30,9 +30,10 @@ K-means on natural images produces ~**2418 fragments** (connected components of 
 1. **BG (Background)**: Merge small regions that are likely background noise — regions touching the frame edge with area < threshold.
 2. **MS (Mean-shift)**: If two adjacent regions have a mean-shift distance below threshold, merge them (they belong to the same perceptual color).
 3. **Scale (Size guard)**: Merge tiny regions (area below min_size) into their dominant neighbor by color similarity.
-4. **Area**: The key merge — `min(area_i, area_j) × ‖color_i - color_j‖² < λ`. A *large* region can absorb a *small* region if they're color-similar. This is what collapses isolated micro-fragments.
+4. **Area**: The key merge — `min(area_i, area_j) × ‖color_i - color_j‖² < λ`. A _large_ region can absorb a _small_ region if they're color-similar. This is what collapses isolated micro-fragments.
 
 **Why this matters for SVG-gen**:
+
 - test4's 123K nodes (vs 10K-54K for all others) are directly caused by K-means fragmentation surviving into the contour pipeline
 - Area merging would operate AFTER K-means, BEFORE contour extraction — it's a post-quantization cleanup pass
 - Implementation: OpenCV `cv2.connectedComponentsWithStats` per label → adjacency graph → iterative merge
@@ -66,6 +67,7 @@ VTracer uses a **stacking/layering** strategy (similar to our painter's algorith
 ### Why Gaussian smoothing has limits
 
 Gaussian smoothing applies uniform smoothing to all boundary points. This:
+
 - Rounds corners (bad — corners should be preserved)
 - Doesn't distinguish between noise and real curvature
 - Has no awareness of curvature magnitude
@@ -75,16 +77,19 @@ Gaussian smoothing applies uniform smoothing to all boundary points. This:
 ASF evolves the curve according to: **∂C/∂t = κ^(1/3) · N**
 
 Where:
+
 - κ = discrete curvature at each point
 - N = inward unit normal
 - (1/3) exponent is the key — it's the affine-invariant exponent
 
 **Why κ^(1/3) is better than Gaussian**:
+
 - κ^(1/3) dampens high-curvature points LESS than κ (mean curvature flow). Sharp corners survive because their high κ value is cube-root-dampened.
 - Affine invariance means the result is independent of parameterization
 - Eliminates pixelation (oscillating curvature from pixel staircase) while preserving genuine corners
 
 **Discrete implementation**:
+
 ```python
 def affine_shortening_step(pts, dt=0.15):
     """One step of affine shortening flow on a closed polygon."""
@@ -177,6 +182,7 @@ DiffVG (Li et al. 2020) makes SVG rendering differentiable, enabling gradient-ba
 **Core capability**: Given an initial SVG approximation, DiffVG can refine control point positions, colors, and opacities by backpropagating the pixel loss.
 
 **Why it's not viable for SVG-gen current pipeline**:
+
 - Requires GPU (PyTorch CUDA)
 - Slow per-image (minutes not seconds)
 - Works best on simple shapes (logos, illustrations), not photorealistic content
@@ -190,16 +196,16 @@ DiffVG (Li et al. 2020) makes SVG rendering differentiable, enabling gradient-ba
 
 ## Key Techniques Summary (actionable for SVG-gen)
 
-| Technique | Source | Applicable? | Status |
-|-----------|--------|-------------|--------|
-| Area region merging post-K-means | He et al. 2024 | YES — directly addresses test4 123K nodes | H-RM1, READY |
-| Pre-RDP staircase removal | VTracer | YES — low risk, pre-simplification | H-RM4, READY |
-| Affine shortening flow smoothing | LIVE/geometry | YES — can replace Gaussian smoothing | H-RM2, READY |
-| Inflection-point splitting pre-simplification | VTracer | POSSIBLE (different from June 2025 attempt) | See kb-what-failed §note |
-| SLIC + RAG quantization | He et al. 2024 | YES — but higher effort/risk | H7, READY |
-| Potrace optimal polygon DP | Potrace | DONE — already in pipeline | |
-| Painter's algorithm layering | VTracer/LIVE | DONE — already in pipeline | |
-| Differentiable optimization | DiffVG | NOT viable (requires GPU) | H8, blocked |
+| Technique                                     | Source         | Applicable?                                 | Status                   |
+| --------------------------------------------- | -------------- | ------------------------------------------- | ------------------------ |
+| Area region merging post-K-means              | He et al. 2024 | YES — directly addresses test4 123K nodes   | H-RM1, READY             |
+| Pre-RDP staircase removal                     | VTracer        | YES — low risk, pre-simplification          | H-RM4, READY             |
+| Affine shortening flow smoothing              | LIVE/geometry  | YES — can replace Gaussian smoothing        | H-RM2, READY             |
+| Inflection-point splitting pre-simplification | VTracer        | POSSIBLE (different from June 2025 attempt) | See kb-what-failed §note |
+| SLIC + RAG quantization                       | He et al. 2024 | YES — but higher effort/risk                | H7, READY                |
+| Potrace optimal polygon DP                    | Potrace        | DONE — already in pipeline                  |                          |
+| Painter's algorithm layering                  | VTracer/LIVE   | DONE — already in pipeline                  |                          |
+| Differentiable optimization                   | DiffVG         | NOT viable (requires GPU)                   | H8, blocked              |
 
 ---
 

@@ -1,4 +1,5 @@
 <!-- June 2025 — Bézier fitter session -->
+
 - **Taubin smoothing on contour points** (λ=0.5/μ=-0.53, 1-3 iterations): Meant to smooth pixel-grid noise without shrinking. Even 1 iteration degraded Feature% by 2-4% and worsened MnDif. At 3 iterations: Ref Feature% 94→90.9, test2 MnDif 8.27→14.31. Root cause: any input point movement hurts metrics because pixel boundaries ARE the ground truth for comparison.
 - **Taubin with gentle params** (λ=0.15, μ=-0.16, 2 iter): Marginal — Feature% -0.4%, MnDif flat. Not worth the complexity.
 - **G1 continuity enforcement** (post-fit `enforce_g1_continuity`): Moves control points to align tangents at joins. Catastrophic — Feature% -3.7% for Ref, test2 WdErr -17.66→-22.20. The weighted average tangent reduces curve bulge, systematically narrowing features.
@@ -6,15 +7,14 @@
 - **Increasing max_error from 1.5 to 2.0**: WORSENED WdErr across all images (test2: -17.66→-20.16). Longer Bézier segments narrow features MORE because they have more freedom to deviate inward from the polygon.
 - **Relaxing line art params** (epsilon 0.14→0.30×, max_error 0.22→0.45×): Feature% dropped 4.2% for Ref. Any relaxation of line art fitting loses detail in thin strokes. The current 0.14×/0.22× multipliers are well-tuned.
 - **simplify_epsilon=0.75**: Too fine. Ref Feature% dropped 5%, test5 Extra% tripled to 22%. Causes instability in contour processing.
-- **Line art contour smoothing** (_smooth_contour on line art paths): Ref Feature% 95.6→93.8, Miss% 3.2→8.2. Even very light smoothing (sigma=0.72 at S=4) smears thin text strokes and fine flower details. Binary threshold contours ARE already clean — smoothing only hurts. Same conclusion as prior KB entry: NO smoothing for line art.
-
+- **Line art contour smoothing** (\_smooth_contour on line art paths): Ref Feature% 95.6→93.8, Miss% 3.2→8.2. Even very light smoothing (sigma=0.72 at S=4) smears thin text strokes and fine flower details. Binary threshold contours ARE already clean — smoothing only hurts. Same conclusion as prior KB entry: NO smoothing for line art.
 
 <!-- June 2025 additions -->
+
 - **SVG gap-sliver stroke**: Adding `stroke="same-color" stroke-width="X"` to fill paths to eliminate white gaps between adjacent regions. Problem: SVG viewBox is at working resolution (1/S of original), so any SVG-unit stroke-width gets multiplied by S when rendered at full resolution. Even 0.15 SVG units at S=4 = 0.6px, causing +4px WdErr regression. `vector-effect="non-scaling-stroke"` not supported by cairosvg. NOT VIABLE for this pipeline's coordinate system.
 - **Uniform contour subsampling for Bézier fitting**: Replacing RDP with `np.linspace` subsampling of smoothed contour. CATASTROPHIC — test2 WdErr -35.72 (collapsed), MnDif 40.30. Uniform subsampling doesn't preserve the shape because OpenCV contour points are unevenly distributed (dense in curves, sparse in straights).
 - **Reducing simplify_epsilon (RDP) to 1.2-1.3**: Caused instability with OLD fitter (before alpha clamp + tangent span fixes). At 1.3: test5 Extra% exploded to 22.2%. At 1.2: test2 WdErr flipped to -6.93. ⚠️ With FIXED fitter (alpha clamp 1.5x, tangent span=3), epsilon=1.0 works WELL — see kb-what-works.md. But 0.75 is still too aggressive (Extra% triples).
 - **Stronger chroma_iso_adj/K_iso_adj**: Increasing chroma adjustment 0.015/0.0005→0.018/0.0006 and K adjustment 0.02/(K-8)*0.0025→0.025/(K-7)*0.003 caused test5 Extra% to explode to 22.9%. These relaxations are too aggressive.
-
 
 # What Failed — DO NOT RETRY without new evidence
 
@@ -79,7 +79,7 @@ Each entry: what was tried → what happened → why it failed.
 
 - **LAB ΔE guard in gradient merge** → ineffective (blocked wrong pairs, tripled node count)
 - **gradient_aware_merge** is NOT the cause of test5 yellow loss (confirmed: 0 merges for test5)
-- **_merge_close_clusters lab_threshold=6.0** → very tight already, not the problem
+- **\_merge_close_clusters lab_threshold=6.0** → very tight already, not the problem
 
 - **Ungated large-chromatic-fill thin override / iso relaxation** → helped `test4` but regressed mixed-color images (`test5` Extra 8.5→9.1, full-suite instability risk). The fix must be gated to yellow-dominant images rather than applied globally.
 - **Universal `optimize_svg_colors` post-pass** → catastrophic on high-saturation images. Measured with `--optimize-colors`: `test3` collapsed 87.0→44.6 Feature while geometry remained intact. The pass must be gated by image content, not applied globally.
@@ -101,8 +101,7 @@ Each entry: what was tried → what happened → why it failed.
 - **Broader thin-cluster classification on very large low-K images** (`cluster_mean_thick < 3.2`, `interior < 0.38`) → no measurable effect on `test3`; metrics stayed **87.1 / 6.6 / 16.6 / +13.91 / 1.88**. The error-driving clusters were still not moving through a different extraction path.
 - **Downscaled mean-shift prefilter for >16MP images before K-means** → materially changed `test3` geometry but was visually rejected. Stronger version reached **83.9 / 6.6 / 13.5 / +10.28 / 1.90** and a milder version reached **85.0 / 6.5 / 15.9 / +11.53 / 1.88**; blind visual comparison found no cleaner hand-traced result, only slight regression / equivalence. Do not pursue this prefilter direction without a different visual upside.
 
-
-## _merge_short_curves in _fit_contour (March 2026)
+## \_merge_short_curves in \_fit_contour (March 2026)
 
 - Function exists but was never called. Added to pipeline between reduce_nodes and merge_segments_artistic.
 - Zero measurable effect on any image — node counts identical, metrics unchanged.
@@ -122,7 +121,7 @@ Each entry: what was tried → what happened → why it failed.
 
 ## Inflection-point splitting in curve fitter (June 2025)
 
-- Tested 3 variants: (1) top-level injection in fit_bezier_path + _fit_closed_direct, (2) recursive fitter only (>60pt + error-driven redirect), (3) only >60pt inflection split.
+- Tested 3 variants: (1) top-level injection in fit_bezier_path + \_fit_closed_direct, (2) recursive fitter only (>60pt + error-driven redirect), (3) only >60pt inflection split.
 - Variant 1: Ref Feature 95.6→94.1, test5 WdErr +3.61. Pixel-grid inflections in RDP polygon are noise.
 - Variant 2: Ref 95.4/58.5, test2 WdErr +8.67. Moving splits from max-error points worsens both sub-fits.
 - Variant 3: Identical to baseline — RDP already reduces contours below 60 points.
@@ -136,6 +135,5 @@ Each entry: what was tried → what happened → why it failed.
 - 3.0 native px: test5 Feature 78.0% (-6.5%). Still terrible.
 - 5.0 native px: test5 Feature 79.1% (-5.4%). Still terrible.
 - Root cause: Painter's algorithm FUNDAMENTALLY REQUIRES soft-field overlap for seamless rendering. Any hard clipping creates underpainting gaps between clusters.
-
 
 ## If it's listed here, you need a fundamentally different approach, not a retry.

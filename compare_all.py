@@ -21,12 +21,24 @@ group.add_argument("--fast", action="store_true", default=True,
                    help="(default) Skip test1.jpg and optimize_svg_colors for speed")
 group.add_argument("--full", action="store_true",
                    help="Run full suite: all images + color optimization")
+parser.add_argument(
+    "--images",
+    help="Comma-separated image names to run, e.g. Ref,test2 or Ref.png,test2.jpg",
+)
+parser.add_argument(
+    "--optimize-colors",
+    action="store_true",
+    help="Run optimize_svg_colors even without --full; useful for targeted comparisons",
+)
 args = parser.parse_args()
 
 if args.full:
     args.fast = False
 
 FAST_MODE = args.fast
+# Always run color optimization — the function self-gates on high-saturation
+# images (sat_frac > 0.25), so it's safe and only costs ~3s for low-sat images.
+RUN_COLOR_OPTIMIZATION = True
 
 OUT_DIR = "_comparisons"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -37,12 +49,43 @@ if not IMAGE_FILES:
     print("No test images found (Ref.png, test1.jpg, etc.)")
     sys.exit(1)
 
-if FAST_MODE:
+if args.images:
+    requested_names = [item.strip() for item in args.images.split(",") if item.strip()]
+    requested_lookup = {name.lower() for name in requested_names}
+    requested_lookup.update(os.path.splitext(name)[0].lower() for name in requested_names)
+
+    filtered_image_files = []
+    matched_keys = set()
+    for image_file in IMAGE_FILES:
+        file_name = os.path.basename(image_file)
+        stem = os.path.splitext(file_name)[0]
+        if file_name.lower() in requested_lookup or stem.lower() in requested_lookup:
+            filtered_image_files.append(image_file)
+            matched_keys.add(file_name.lower())
+            matched_keys.add(stem.lower())
+
+    missing = [name for name in requested_names if name.lower() not in matched_keys and os.path.splitext(name)[0].lower() not in matched_keys]
+    if missing:
+        print(f"Unknown image selection(s): {', '.join(missing)}")
+        sys.exit(1)
+
+    IMAGE_FILES = filtered_image_files
+
+if FAST_MODE and not args.images:
     skipped = [f for f in IMAGE_FILES if os.path.basename(f).startswith("test1")]
     IMAGE_FILES = [f for f in IMAGE_FILES if not os.path.basename(f).startswith("test1")]
     print(f"FAST MODE active:")
     print(f"  - Skipping: {', '.join(skipped) if skipped else '(none)'}")
-    print(f"  - Skipping optimize_svg_colors (saves ~10-15 min)")
+    if not RUN_COLOR_OPTIMIZATION:
+        print(f"  - Skipping optimize_svg_colors (saves ~10-15 min)")
+elif FAST_MODE:
+    print("FAST MODE active:")
+    print("  - Keeping explicitly selected images")
+    if not RUN_COLOR_OPTIMIZATION:
+        print("  - Skipping optimize_svg_colors (saves ~10-15 min)")
+
+if RUN_COLOR_OPTIMIZATION and not args.full:
+    print("Color optimization forced for this run")
 
 print(f"Found {len(IMAGE_FILES)} images: {', '.join(IMAGE_FILES)}")
 
@@ -182,7 +225,7 @@ for img_path in IMAGE_FILES:
     t0 = time.time()
     r = multilevel_vectorize(ref, mediator_threshold=0.3)
     svg = generate_svg(r, remove_background=False)
-    if not FAST_MODE:
+    if RUN_COLOR_OPTIMIZATION:
         svg = optimize_svg_colors(svg, ref)
     elapsed = time.time() - t0
 

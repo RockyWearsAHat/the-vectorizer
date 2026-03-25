@@ -84,3 +84,64 @@ After every subagent round, update:
 - Start an iteration without a clear, falsifiable hypothesis
 - Override a subagent's accept/reject without metric evidence
 - Queue more than ONE hypothesis per subagent invocation
+
+## Stopping Rules
+
+Stop and report to the user when:
+
+- `check_regression.py` reports a MAJOR regression — revert the change before reporting.
+- 3 consecutive parameter-only iterations produce no improvement — escalate to an algorithmic hypothesis per the Creative Problem-Solving Ratchet.
+- subagent-developer reports a blocker it cannot resolve.
+- The user signals the current task is complete.
+- You have exhausted all READY hypotheses in kb-research-queue.md without improvement.
+
+## Default Workflow for Any Quality Improvement Task
+
+**Your default workflow for any quality improvement task:**
+
+1. **Read the KB** (readFile): `.github/knowledge/kb-baselines.md`, `kb-research-queue.md`, `kb-what-failed.md`, `kb-per-image.md`
+2. **Identify the biggest bottleneck**: Lowest Feat%, highest WdErr, worst MnDif
+3. **Pick the top READY hypothesis** from `kb-research-queue.md` that hasn't been tried
+4. **Anti-stalling check**: If 3+ parameter tweaks in a row have failed → switch to an algorithmic hypothesis
+5. **Implement via `@subagent-developer`** with a precise task prompt including: hypothesis, target metric, affected image, acceptance criteria, and revert condition
+6. **Validate**: run `compare_all.py` then `check_regression.py`. STOP on MAJOR regression.
+7. **Update KB**: move result to `kb-what-works.md` or `kb-what-failed.md`, update `kb-research-queue.md` status
+
+## Creative Problem-Solving Ratchet
+
+This project requires **genuine creative judgment**, not blind parameter tuning. Enforce this ratchet:
+
+### Level 1 — Parameter tuning (first resort)
+
+Try parameter changes only when you have a **specific causal hypothesis**: _"X parameter controls Y behavior, which is causing Z metric to be wrong because…"_
+
+### Level 2 — Algorithm change (after 3 failed tunings in the same category)
+
+If you've tried 3 parameter changes targeting the same metric and all regressed or were neutral, **stop tuning**. You've found a tuning dead end. The problem requires a structural fix.
+
+- Read `kb-research-queue.md` for the next READY algorithmic hypothesis
+- Read `svg-vectorization-research.md` for evidence about what actually works
+
+### Level 3 — Structural rethink (when algorithm is blocked)
+
+If both parameter tuning and algorithmic changes are blocked, step back and ask:
+
+- **What is the actual failure mode?** (fragmentation? over-expansion? node inflation?)
+- **What does the research say causes this failure?** (read `svg-vectorization-research.md`)
+- **What structural change would address the ROOT CAUSE?** (not the symptom)
+
+### Anti-patterns (never do these)
+
+- Trying iso=0.43 after iso=0.44 failed without a new hypothesis — this is not creative, it's random walk
+- Making 5 consecutive parameter tweaks to the same value
+- Calling a regression "acceptable" to avoid reverting
+- Adding complexity (new special cases, guards, gates) without evidence they'll help
+
+### Creative license (encouraged)
+
+When standard approaches are blocked, the right move is **creative structural thinking**:
+
+- Study what the best vectorizers do (see `svg-vectorization-research.md`)
+- Question pipeline assumptions (does painter's algorithm require soft-field overlap? yes — see kb-what-failed)
+- Consider approaching the problem from a completely different angle
+- Propose a novel hypothesis with a clear causal mechanism, even if it hasn't been tried by others

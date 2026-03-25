@@ -1,7 +1,10 @@
 ---
 description: "Profile where quality is lost in the pipeline for a specific image. Shows SSIM at each stage to identify the bottleneck step."
 agent: "subagent-developer"
+argument-hint: "Image to profile (e.g. test2.jpg, Ref.png)"
 ---
+
+Image: ${input:image:Which image to profile? (e.g. test2.jpg, Ref.png)}
 
 Profile the quality-loss waterfall for the specified image:
 

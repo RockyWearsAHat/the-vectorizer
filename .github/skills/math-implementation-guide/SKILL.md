@@ -5,7 +5,7 @@ description: "Bridges research math to NumPy/OpenCV code for each high-priority 
 
 # Math-to-Code Implementation Guide
 
-This skill file bridges the gap between VECTORIZATION_RESEARCH_REPORT.md (the _what_) and actual NumPy/OpenCV implementation (the _how_). Each section provides:
+This skill file bridges the gap between `.github/knowledge/svg-vectorization-research.md` (the _what_) and actual NumPy/OpenCV implementation (the _how_). Each section provides:
 
 1. The mathematical formulation with variable definitions
 2. The exact NumPy/OpenCV translation

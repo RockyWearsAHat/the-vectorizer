@@ -1,16 +1,14 @@
 # What Works — Proven Architecture & Techniques
 
-
 ## 4-point interpolatory subdivision (June 2025)
 
-- **_subdivide_4point_closed**: After RDP simplification, insert midpoints between non-corner vertices using the 4-point scheme (Dyn, Levin, Gregory 1987, ω=1/16).
+- **\_subdivide_4point_closed**: After RDP simplification, insert midpoints between non-corner vertices using the 4-point scheme (Dyn, Levin, Gregory 1987, ω=1/16).
 - Original vertices preserved (interpolatory). Corners and their immediate neighbors skipped.
 - Provides denser, geometrically optimal input for Bézier fitter in smooth sections.
 - Consistent improvement across ALL 5 images: Ref Extra% -3.4pp, test2 MnDif -2.27, test3 Feat% +0.9, test4 Miss% -0.8/MnDif -1.30, test5 WdErr -2.12.
 - Tradeoff: 1-10% more nodes (test3 has the biggest increase).
 - Simple midpoint insertion (ω=0) also helps but slightly less than 4-point.
-- Placed in _fit_contour between cv2.approxPolyDP and fit_closed_bezier.
-
+- Placed in \_fit_contour between cv2.approxPolyDP and fit_closed_bezier.
 
 ## Core architecture (validated, don't replace)
 
@@ -49,10 +47,10 @@
 
 ## Dark cluster merge (June 2025)
 
-- **Adaptive LAB threshold in _merge_close_clusters**: Weber's law — JND is larger at low luminance, so very dark clusters look perceptually identical despite having LAB ΔE > 6. Modified threshold: `pair_thresh = lab_threshold * max(1.0, 2.0 - avg_L / 25.0)`. At L=3 (near-black): threshold doubles to 12. At L=25: threshold is 6 (normal). At L>50: threshold is 6.
+- **Adaptive LAB threshold in \_merge_close_clusters**: Weber's law — JND is larger at low luminance, so very dark clusters look perceptually identical despite having LAB ΔE > 6. Modified threshold: `pair_thresh = lab_threshold * max(1.0, 2.0 - avg_L / 25.0)`. At L=3 (near-black): threshold doubles to 12. At L=25: threshold is 6 (normal). At L>50: threshold is 6.
 - **Impact on test2**: WdErr -14.64→+7.81 (median +1.04), Feature% 97.3→97.5, Miss% 0.9→0.6, nodes -25%, SVG -24%. Dark background gray patches eliminated.
 - **No effect on other images** — only test2 had multiple near-black clusters.
-- **Note**: _gradient_aware_merge was NOT changed. The default boundary_contrast_thresh=22 handles the remaining dark cluster merge. Only _merge_close_clusters needed the adaptive threshold.
+- **Note**: \_gradient_aware_merge was NOT changed. The default boundary_contrast_thresh=22 handles the remaining dark cluster merge. Only \_merge_close_clusters needed the adaptive threshold.
 
 ## Performance techniques (pure Python + NumPy + OpenCV)
 
@@ -76,7 +74,7 @@
 
 - Detection: mean_saturation < 20, K ≤ 6, background > 70%
 - Hysteresis thresholding (strict+lenient) is the best approach
-- Optimal: strict=min(otsu*0.82, 145), lenient=min(otsu, 170)
+- Optimal: strict=min(otsu\*0.82, 145), lenient=min(otsu, 170)
 - NO contour smoothing (binary threshold contours are clean)
 - Tight Bézier params (epsilon*0.2, max_error*0.3)
 - crispEdges rendering improves Feature by ~4pp
@@ -95,7 +93,6 @@
 - **Results**: Ref Extra% **46.8 → 27.6** (-19.2pp!), WdErr **+0.98 → +0.04** (nearly perfect), MnDif **5.72 → 5.22** (-0.50), Feat% 91.8 → 90.6 (-1.2pp acceptable).
 - **Visual**: Blind visual review confirmed hand-traced quality with appropriate stroke weights — the previous version was "too heavy/bold."
 
-
 ## Gradient detection
 
 - 2-stop and 3-stop linear gradients supported
@@ -111,7 +108,6 @@
 
 - `optimize_svg_colors` should be treated as a low-saturation cleanup pass, not a universal post-process. Gating it off for high-saturation images (`sat_frac > 0.25`) avoids severe regressions on `test3` and improves the saturated photo set overall.
 - For high-saturation mural-like photos such as `test5`, conservative large-group detail overlays inside very large high-variance contour groups can improve internal mural fidelity without broad regressions. Current accepted effect: `test5` held **82.2 / 3.2 / 9.0** while improving `MnDif` from **10.59 -> 10.46**.
-
 
 ## Theoretical ceiling
 

@@ -22,6 +22,7 @@ the inner and outer bounds, weighted by color transition strength.
 """
 
 import math
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,13 +31,15 @@ import cv2
 import numpy as np
 from dataclasses import dataclass
 from scipy.ndimage import distance_transform_edt, gaussian_filter1d
-from skimage.measure import find_contours
 from ..curve_fitting import (
     fit_closed_bezier, fit_bezier_path, reduce_nodes, FittedCurve,
     enforce_g1_continuity, merge_segments_artistic,
 )
 from skimage.morphology import skeletonize as _skeletonize
 from ..stroke_reconstruction import _prune_skeleton, _trace_skeleton_paths
+
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,7 @@ class VectorLayer:
     opacities: list[float]  # opacity for each iso-level path
     color: str              # hex fill colour
     shapes: list[str] | None = None  # SVG shape elements (circle, rect, ellipse)
+    path_fills: list[str] | None = None  # optional per-path fill refs
 
 
 @dataclass
@@ -68,6 +72,19 @@ class GradientDef:
     color_start: str      # hex start color
     color_end: str        # hex end color
     color_mid: str | None = None  # optional hex mid-stop color
+    kind: str = "linear"
+    cx: float | None = None
+    cy: float | None = None
+    r: float | None = None
+    fx: float | None = None
+    fy: float | None = None
+
+
+@dataclass
+class GradientRegionAssignment:
+    fill_ref: str
+    bbox: tuple[float, float, float, float]
+    mask: np.ndarray
 
 
 @dataclass
@@ -177,6 +194,97 @@ def _compute_hard_edge_confidence(
     return np.clip(hard_edge, 0.0, 1.0).astype(np.float32)
 
 
+def _render_color_from_samples(samples: np.ndarray, base_color: np.ndarray) -> np.ndarray:
+    lo = np.percentile(samples, 10.0, axis=0)
+    hi = np.percentile(samples, 90.0, axis=0)
+    clipped = np.clip(samples, lo, hi)
+    raw_mean = samples.mean(axis=0)
+    clipped_mean = clipped.mean(axis=0)
+    base_hsv = cv2.cvtColor(base_color.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_BGR2HSV)[0, 0]
+    hue = int(base_hsv[0])
+    is_warm_family = hue <= 45 or hue >= 170
+    if float(base_hsv[1]) >= 80 and is_warm_family:
+        sat_blend = min(0.35, float(base_hsv[1]) / 255.0 * 0.35)
+        return (
+            clipped_mean * (1.0 - sat_blend)
+            + raw_mean * 0.5 * sat_blend
+            + base_color * 0.5 * sat_blend
+        )
+    return clipped_mean
+
+
+def _compute_render_centers(
+    labels: np.ndarray,
+    source_bgr: np.ndarray,
+    base_centers_u: np.ndarray,
+) -> np.ndarray:
+    """Re-estimate display colors from original pixels without affecting geometry."""
+    K = len(base_centers_u)
+    render_centers = base_centers_u.astype(np.float32).copy()
+    rng = np.random.default_rng(0)
+
+    for k in range(K):
+        ys, xs = np.where(labels == k)
+        if len(ys) == 0:
+            continue
+        if len(ys) > 6000:
+            idx = rng.choice(len(ys), 6000, replace=False)
+            ys = ys[idx]
+            xs = xs[idx]
+        samples = source_bgr[ys, xs].astype(np.float32)
+        base_color = base_centers_u[k].astype(np.float32)
+        render_centers[k] = _render_color_from_samples(samples, base_color)
+
+    return np.clip(np.round(render_centers), 0, 255).astype(np.uint8)
+
+
+def _precompute_nearest_clusters(
+    dist_map: np.ndarray,
+    k_neighbors: int = 4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return up to k nearest cluster indices and distances per pixel."""
+    k_use = max(1, min(k_neighbors, dist_map.shape[2]))
+    nn_idx = np.argpartition(dist_map, k_use - 1, axis=2)[:, :, :k_use]
+    nn_dist = np.take_along_axis(dist_map, nn_idx, axis=2)
+    order = np.argsort(nn_dist, axis=2)
+    nn_idx = np.take_along_axis(nn_idx, order, axis=2)
+    nn_dist = np.take_along_axis(nn_dist, order, axis=2)
+    return nn_idx, nn_dist
+
+
+def _soft_competing_distance(
+    cluster_idx: int,
+    nn_idx: np.ndarray,
+    nn_dist: np.ndarray,
+    max_competitors: int = 3,
+) -> np.ndarray:
+    """Ambiguity-gated softmin competitor distance from nearest non-self clusters."""
+    candidate_dists = np.where(nn_idx == cluster_idx, np.inf, nn_dist)
+    candidate_dists = np.sort(candidate_dists, axis=2)
+    competitor_count = min(max_competitors, candidate_dists.shape[2])
+    competitors = candidate_dists[:, :, :competitor_count]
+    finite = np.isfinite(competitors)
+    nearest = np.where(finite[:, :, 0], competitors[:, :, 0], nn_dist[:, :, 0])
+
+    if os.environ.get("SVG_SOFT_COMP_MODE") == "nearest":
+        return nearest.astype(np.float32)
+
+    tau = 6.0
+    shifted = np.where(finite, np.exp(-(competitors - nearest[:, :, None]) / tau), 0.0)
+    softmin = nearest - tau * np.log(np.maximum(np.sum(shifted, axis=2), 1e-6))
+    softmin = np.clip(softmin, 0.55 * nearest, nearest)
+
+    if competitor_count > 1:
+        second = np.where(finite[:, :, 1], competitors[:, :, 1], np.inf)
+        ambiguity = 1.0 - np.clip((second - nearest) / np.maximum(8.0, nearest * 0.5), 0.0, 1.0)
+    else:
+        ambiguity = np.zeros_like(nearest)
+
+    blend = 0.18 * ambiguity
+    soft_other = nearest * (1.0 - blend) + softmin * blend
+    return soft_other.astype(np.float32)
+
+
 def _build_local_iso_map(
     base_iso: float,
     hard_edge_conf: np.ndarray,
@@ -204,9 +312,9 @@ def multilevel_vectorize(
     image_bgr: np.ndarray,
     *,
     num_levels: int = 0,
-    simplify_epsilon: float = 1.5,
-    max_error: float = 2.0,
-    line_tolerance: float = 1.2,
+    simplify_epsilon: float = 1.0,
+    max_error: float = 1.5,
+    line_tolerance: float = 0.5,
     corner_threshold: float = 55.0,
     min_contour_area: int = 12,
     contour_scale: int = 4,
@@ -214,6 +322,8 @@ def multilevel_vectorize(
     mediator_threshold: float = 0.3,   # backward compat (used in absorption)
 ) -> MultilevelResult:
     h, w = image_bgr.shape[:2]
+    _warm_debug = os.environ.get("SVG_WARM_DEBUG") == "1"
+    _cluster_debug = os.environ.get("SVG_CLUSTER_DEBUG") == "1"
 
     if len(image_bgr.shape) == 2:
         image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
@@ -222,6 +332,7 @@ def multilevel_vectorize(
     bg_color, bg_gray = detect_background(image_bgr)
     bg_hex = _bgr_to_hex(bg_color)
     source_lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    source_hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
     # --- Step 0: Edge-density map for adaptive processing ---
     edge_weight = _compute_edge_weight(image_bgr)
@@ -233,8 +344,17 @@ def multilevel_vectorize(
     # Fast Gaussian blur instead of expensive bilateral filter.
     # Vectorization quantizes colors anyway, so edge-preserving denoising
     # is overkill. GaussianBlur is 10-100× faster.
-    denoised_km = cv2.GaussianBlur(image_bgr, (7, 7), 0)
     denoised_dist = cv2.GaussianBlur(image_bgr, (5, 5), 0)
+
+    # Mean-shift prefilter for K-means: flattens uniform regions while
+    # preserving edges — produces more coherent color clusters than
+    # isotropic Gaussian blur alone. Skip for very large images (>12MP).
+    if h * w <= 12_000_000:
+        _ms_level = 2 if h * w > 6_000_000 else 1
+        denoised_km = cv2.pyrMeanShiftFiltering(image_bgr, sp=8, sr=16,
+                                                 maxLevel=_ms_level)
+    else:
+        denoised_km = cv2.GaussianBlur(image_bgr, (7, 7), 0)
     _t_denoise = time.time()
 
     # --- Step 1: K-means colour quantization ---
@@ -252,14 +372,22 @@ def multilevel_vectorize(
     # Detect color using fraction of saturated pixels, not mean.
     # Mean misses minority chromatic regions (e.g. 2.5% red wheels on gray car).
     _sat_frac = float(np.count_nonzero(_hsv_check[:, :, 1] > 30)) / max(1, h * w)
+    _sat_mask = _hsv_check[:, :, 1] > 35
+    _sat_count = int(np.count_nonzero(_sat_mask))
+    if _sat_count > 0:
+        _hue_sat = _hsv_check[:, :, 0]
+        _warm_yellow_frac = float(np.count_nonzero(_sat_mask & (_hue_sat >= 12) & (_hue_sat <= 45))) / _sat_count
+        _red_frac = float(np.count_nonzero(_sat_mask & ((_hue_sat <= 10) | (_hue_sat >= 170)))) / _sat_count
+    else:
+        _warm_yellow_frac = 0.0
+        _red_frac = 0.0
+    _enable_warm_fill_relax = _sat_frac > 0.25 and _warm_yellow_frac > 0.72 and _red_frac < 0.12
     _has_color = _mean_sat > 15 or _sat_frac > 0.01
     # Dynamic max_k: match documented tiers that gave best quality.
     # Color distinction removed — extra clusters fragment features more than
     # they help color fidelity (test4 regressed 96.5% → 83% with K=10 vs K=7).
     if h * w > 16_000_000:
-        _max_k = 8
-    elif h * w > 8_000_000:
-        _max_k = 12
+        _max_k = 10
     elif h * w > 4_000_000:
         _max_k = 12
     else:
@@ -279,6 +407,9 @@ def multilevel_vectorize(
     _CHROMA_WEIGHT = 2.0
     all_pixels[:, 1] *= _CHROMA_WEIGHT
     all_pixels[:, 2] *= _CHROMA_WEIGHT
+    _flat_pixels = all_pixels
+    _p_sq = np.sum(_flat_pixels ** 2, axis=1)
+    _chunk_size = 2_000_000
     n_pixels = len(all_pixels)
     _KM_SAMPLE = 500_000
     # Seed OpenCV's internal RNG so K-means++ is reproducible regardless of
@@ -295,12 +426,9 @@ def multilevel_vectorize(
         # Fast label assignment using ||p-c||² = ||p||² - 2·p·cᵀ + ||c||²
         # Matrix multiply is much faster than broadcasting for large N.
         # Use LAB pixels for distance computation (perceptually uniform)
-        _flat_pixels = all_pixels  # already LAB float32
         _centers_f32 = centers.astype(np.float32)
-        _p_sq = np.sum(_flat_pixels ** 2, axis=1)  # (N,)
         _c_sq = np.sum(_centers_f32 ** 2, axis=1)  # (K,)
         # p·cᵀ is (N, K) — use matrix multiply in chunks to control memory
-        _chunk_size = 2_000_000
         labels = np.empty(n_pixels, dtype=np.int32)
         for _cs in range(0, n_pixels, _chunk_size):
             _ce = min(_cs + _chunk_size, n_pixels)
@@ -316,7 +444,6 @@ def multilevel_vectorize(
     # Undo chrominance weighting before converting centers back to BGR
     centers[:, 1] /= _CHROMA_WEIGHT
     centers[:, 2] /= _CHROMA_WEIGHT
-    centers_lab = centers.copy()
     centers_bgr = np.zeros_like(centers)
     for i in range(len(centers)):
         lab_pixel = centers[i].reshape(1, 1, 3).astype(np.uint8)
@@ -348,6 +475,17 @@ def multilevel_vectorize(
     ])
     bg_cluster_idx = int(np.argmin(bg_dists))
     bg_cluster = bg_cluster_idx if bg_dists[bg_cluster_idx] < 40.0 else -1
+    if _cluster_debug:
+        _premerge_hsv = cv2.cvtColor(centers_u.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        _parts = []
+        for k in range(K):
+            _parts.append(
+                f"k{k}:bgr=({int(centers_u[k,0])},{int(centers_u[k,1])},{int(centers_u[k,2])})"
+                f" hsv=({int(_premerge_hsv[k,0])},{int(_premerge_hsv[k,1])},{int(_premerge_hsv[k,2])})"
+                f" px={int(np.count_nonzero(labels == k))}"
+            )
+        print(f"[CLUSTER] bg_color=({int(bg_color[0])},{int(bg_color[1])},{int(bg_color[2])}) bg_cluster={bg_cluster}")
+        print("[CLUSTER] centers_pre " + " | ".join(_parts[:16]))
 
     # --- Step 1d: Gradient-aware merge ---
     # Collapse cluster pairs whose boundary has low color contrast
@@ -358,6 +496,18 @@ def multilevel_vectorize(
         max_color_dist=60.0,
     )
     K = len(centers_f)
+    if _cluster_debug:
+        _centers_post_u = centers_f.astype(np.uint8)
+        _post_hsv = cv2.cvtColor(_centers_post_u.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        _parts = []
+        for k in range(K):
+            _parts.append(
+                f"k{k}:bgr=({int(_centers_post_u[k,0])},{int(_centers_post_u[k,1])},{int(_centers_post_u[k,2])})"
+                f" hsv=({int(_post_hsv[k,0])},{int(_post_hsv[k,1])},{int(_post_hsv[k,2])})"
+                f" px={int(np.count_nonzero(labels == k))}"
+            )
+        print(f"[CLUSTER] post_merge bg_cluster={bg_cluster}")
+        print("[CLUSTER] centers_post " + " | ".join(_parts[:16]))
     _t_merge = time.time()
 
     centers_u = centers_f.astype(np.uint8)
@@ -372,12 +522,16 @@ def multilevel_vectorize(
         cv2.cvtColor(c.reshape(1, 1, 3), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
         for c in centers_u
     ])
+    _centers_hsv_merge = cv2.cvtColor(centers_u.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    _cluster_sizes_premerge = np.bincount(labels.ravel(), minlength=K)
     _dark_chroma_merged = []
     for k in range(K):
         if k == bg_cluster:
             continue
         _L_k = float(_centers_lab_merge[k, 0])
         if _L_k > 35:  # only very dark clusters
+            continue
+        if int(_centers_hsv_merge[k, 1]) >= 90 and int(_cluster_sizes_premerge[k]) < int(h * w * 0.02):
             continue
         _chroma_k = math.sqrt(
             (float(_centers_lab_merge[k, 1]) - 128.0) ** 2
@@ -442,7 +596,6 @@ def multilevel_vectorize(
     lab_dist_img[:, :, 2] *= _CHROMA_WEIGHT
     centers_lab_f[:, 1] *= _CHROMA_WEIGHT
     centers_lab_f[:, 2] *= _CHROMA_WEIGHT
-
     # Compute squared-distance map (skip sqrt — much faster).
     # Use squared distances throughout: soft = d²_other / (d²_k + d²_other).
     # iso threshold is adjusted: iso_sq = iso² / (2*iso² - 2*iso + 1).
@@ -461,13 +614,10 @@ def multilevel_vectorize(
         dist_map_flat[_ds:_de] = _sq_dists
     dist_map = dist_map_flat.reshape(h, w, K)
 
-    # Pre-compute nearest-two clusters for fast soft-field computation.
-    _nn_idx = np.argpartition(dist_map, min(2, K - 1), axis=2)[:, :, :2]
-    _i_grid, _j_grid = np.mgrid[:h, :w]
-    _nn1_idx = _nn_idx[:, :, 0]
-    _nn2_idx = _nn_idx[:, :, 1]
-    _nn1_dist = dist_map[_i_grid, _j_grid, _nn1_idx]
-    _nn2_dist = dist_map[_i_grid, _j_grid, _nn2_idx]
+    # Pre-compute nearest nearby clusters for fast soft-field competition.
+    _nn_idx, _nn_dist = _precompute_nearest_clusters(dist_map, k_neighbors=min(4, K))
+
+    warm_debug_primary_competitor: dict[int, int] = {}
 
     # --- Step 3: Lightest-first painter's algorithm ---
     # Lightest clusters paint first (background), darkest paint last (details on top).
@@ -606,40 +756,96 @@ def multilevel_vectorize(
             cv2.cvtColor(c.reshape(1, 1, 3), cv2.COLOR_BGR2LAB).reshape(3).astype(np.float32)
             for c in centers_u
         ])
-        # Reindex dist_map columns and remap nearest-two indices
+        # Reindex dist_map columns and rebuild nearest competitors
         dist_map = dist_map[:, :, alive].copy()
-        _nn1_idx = remap[_nn1_idx]
-        _nn2_idx = remap[_nn2_idx]
+        _nn_idx, _nn_dist = _precompute_nearest_clusters(dist_map, k_neighbors=min(4, K))
         # Rebuild grays and order
         grays = np.array([
             int(cv2.cvtColor(c.reshape(1, 1, 3), cv2.COLOR_BGR2GRAY)[0, 0])
             for c in centers_u
         ])
         order = np.argsort(-grays)
-        cluster_lightness = grays.astype(np.float64) / 255.0
         # Reset mediator scores — all survivors are real fills
         cluster_mediator_score = np.zeros(K, dtype=np.float64)
 
-    # Compute perceptual lightness for each cluster (0=black, 1=white)
-    cluster_lightness = grays.astype(np.float64) / 255.0
+    centers_hsv_render = cv2.cvtColor(centers_u.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    warm_debug_clusters = [
+        k for k in range(K)
+        if int(centers_hsv_render[k, 1]) >= 35 and 12 <= int(centers_hsv_render[k, 0]) <= 45
+    ]
+    if _warm_debug and warm_debug_clusters:
+        debug_parts = []
+        for k in warm_debug_clusters:
+            debug_parts.append(
+                f"k{k}:hsv=({int(centers_hsv_render[k,0])},{int(centers_hsv_render[k,1])},{int(centers_hsv_render[k,2])}) "
+                f"bgr=({int(centers_u[k,0])},{int(centers_u[k,1])},{int(centers_u[k,2])}) px={int(np.count_nonzero(labels == k))}"
+            )
+        print("[WARM] clusters " + " | ".join(debug_parts[:12]))
+        for k in warm_debug_clusters:
+            mask_k = labels == k
+            if not np.any(mask_k):
+                continue
+            competitor_samples = []
+            for rank in range(_nn_idx.shape[2]):
+                candidates = _nn_idx[:, :, rank][mask_k]
+                candidates = candidates[candidates != k]
+                if candidates.size:
+                    competitor_samples.append(candidates)
+            if not competitor_samples:
+                continue
+            competitor_all = np.concatenate(competitor_samples)
+            competitor_hist = np.bincount(competitor_all.astype(np.int32), minlength=K)
+            competitor_hist[k] = 0
+            warm_debug_primary_competitor[k] = int(np.argmax(competitor_hist))
+            top = np.argsort(competitor_hist)[::-1][:3]
+            top_desc = ", ".join(
+                (
+                    f"k{int(idx)}:{int(competitor_hist[idx])}"
+                    f"(hsv={int(centers_hsv_render[idx,0])},{int(centers_hsv_render[idx,1])},{int(centers_hsv_render[idx,2])})"
+                )
+                for idx in top if competitor_hist[idx] > 0
+            )
+            if top_desc:
+                print(f"[WARM] cluster k{k} nearest competitors {top_desc}")
 
     # --- Step 3e: Classify clusters as thin-feature vs fill ---
     # Thin clusters (text, lines, serifs) need higher iso to avoid
     # thickening and tighter Bézier fitting.
+    render_centers_u = _compute_render_centers(labels, image_bgr, centers_u)
+    if _warm_debug and warm_debug_clusters:
+        render_hsv = cv2.cvtColor(render_centers_u.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        for k in warm_debug_clusters:
+            mask_k = labels == k
+            if not np.any(mask_k):
+                continue
+            src_hsv_mean = source_hsv[mask_k].reshape(-1, 3).mean(axis=0)
+            print(
+                f"[WARM] k{k} source_hsv_mean=({src_hsv_mean[0]:.1f},{src_hsv_mean[1]:.1f},{src_hsv_mean[2]:.1f}) "
+                f"center_hsv=({int(centers_hsv_render[k,0])},{int(centers_hsv_render[k,1])},{int(centers_hsv_render[k,2])}) "
+                f"render_hsv=({int(render_hsv[k,0])},{int(render_hsv[k,1])},{int(render_hsv[k,2])})"
+            )
     cluster_is_thin = np.zeros(K, dtype=bool)
+    cluster_large_chromatic_fill = np.zeros(K, dtype=bool)
     for k in range(K):
         if k == bg_cluster:
             continue
+        cluster_area_frac = float(np.count_nonzero(labels == k)) / max(1, total_pixels)
+        cluster_large_chromatic_fill[k] = (
+            _enable_warm_fill_relax
+            and cluster_area_frac > 0.012
+            and int(centers_hsv_render[k, 1]) >= 35
+        )
         if cluster_mean_thick[k] > 0 and cluster_mean_thick[k] < 2.5:
-            if cluster_interior_frac[k] < 0.25:
+            if cluster_interior_frac[k] < 0.25 and not cluster_large_chromatic_fill[k]:
                 cluster_is_thin[k] = True
 
     # --- Step 3f: Detect gradient regions between adjacent clusters ---
     gradient_defs: list[GradientDef] = []
     gradient_fill_map: dict[int, str] = {}  # cluster_idx → gradient ID
+    single_gradient_regions: dict[int, list[GradientRegionAssignment]] = {}
     _detect_gradients(
-        labels, centers_f, denoised_dist, bg_cluster,
-        w, h, gradient_defs, gradient_fill_map,
+        labels, centers_f, image_bgr, bg_cluster,
+        w, h, gradient_defs, gradient_fill_map, single_gradient_regions,
     )
 
     layers: list[VectorLayer] = []
@@ -655,7 +861,12 @@ def multilevel_vectorize(
     # Adaptive min S: higher S = smoother contour edges.
     _min_S = 2 if h * w > 8_000_000 else (2 if h * w > 4_000_000 else 3)
     _max_S = 4 if h * w > 4_000_000 else contour_scale
-    S = max(_min_S, min(_max_S, int(math.sqrt(_TOTAL_BUDGET / max(h * w * K_render, 1)))))
+    _s_target = math.sqrt(_TOTAL_BUDGET / max(h * w * K_render, 1))
+    if h * w > 16_000_000:
+        _s_choice = int(round(_s_target))
+    else:
+        _s_choice = int(_s_target)
+    S = max(_min_S, min(_max_S, _s_choice))
     print(f"[DIAG] {w}x{h} K_initial={K} K_final={K_render} S={S}")
 
     _t_preprocess = time.time()
@@ -676,37 +887,76 @@ def multilevel_vectorize(
             _is_line_art = True
 
     if _is_line_art:
-        # Hysteresis thresholding: strict core + lenient fringe (connected only)
-        # Use Otsu directly as lenient to capture full AA fringe of thin text
-        _strict_thresh = min(int(_otsu_val * 0.82), 145)
-        _lenient_thresh = min(int(_otsu_val), 185)
+        # Hysteresis thresholding: strict core + selective AA fringe.
+        # Build a solid core plus a lighter fringe layer so anti-aliased
+        # edge pixels don't become full-strength black ink.
+        _strict_thresh = min(int(_otsu_val * 0.90), 155)
+        _core_thresh = min(int(_otsu_val), 165)
 
         # Strict mask: definitely line pixels
         _strict_mask = ((_gray_la <= _strict_thresh) * 255).astype(np.uint8)
-        # Lenient mask: possible line pixels (includes AA fringe)
-        _lenient_mask = ((_gray_la <= _lenient_thresh) * 255).astype(np.uint8)
+        # Core mask: strong line pixels connected to strict cores.
+        _core_mask = ((_gray_la <= _core_thresh) * 255).astype(np.uint8)
 
-        # Find connected components in lenient mask
-        _num_cc, _cc_labels = cv2.connectedComponents(_lenient_mask)
-        # Keep only components that overlap with strict mask
-        _strict_label_ids = set(np.unique(_cc_labels[_strict_mask > 0]).tolist()) - {0}
-        _keep = np.isin(_cc_labels, list(_strict_label_ids))
-        _binary_la = (_keep.astype(np.uint8) * 255)
+        # Keep only connected components that overlap the strict mask.
+        _num_core_cc, _core_labels = cv2.connectedComponents(_core_mask)
+        _strict_core_ids = set(np.unique(_core_labels[_strict_mask > 0]).tolist()) - {0}
+        _core_keep = np.isin(_core_labels, list(_strict_core_ids))
+        _binary_la = (_core_keep.astype(np.uint8) * 255)
 
         # Morph close to bridge small gaps
         _k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         _binary_la = cv2.morphologyEx(_binary_la, cv2.MORPH_CLOSE, _k_close)
 
+        # Restore the erosion split from the known-good line-art path:
+        # keep a thin core fill, route hairlines to strokes, and use the
+        # outer ring as a low-opacity fringe instead of solid ink.
+        _num_line_cc, _line_labels = cv2.connectedComponents((_binary_la > 0).astype(np.uint8))
+        _line_hair_stroke_mask = np.zeros_like(_binary_la, dtype=np.uint8)
+        _line_fill_mask = np.zeros_like(_binary_la, dtype=np.uint8)
+        for _fid in range(1, _num_line_cc):
+            _component = (_line_labels == _fid).astype(np.uint8)
+            if not np.any(_component):
+                continue
+            _dt_comp = cv2.distanceTransform(_component * 255, cv2.DIST_L2, 3)
+            _max_dt = float(_dt_comp.max())
+            if _max_dt <= 1.5:
+                _line_hair_stroke_mask = cv2.bitwise_or(_line_hair_stroke_mask, _component * 255)
+            else:
+                _line_fill_mask = cv2.bitwise_or(_line_fill_mask, _component * 255)
+
+        # Split fill mask into strict core (truly dark) and hysteresis fringe
+        # (AA pixels captured by lenient threshold).  The strict mask IS the
+        # artist's line; the fringe IS the anti-aliasing.
+        _strict_fill = cv2.bitwise_and(_strict_mask, _line_fill_mask)
+        _hyst_fringe = cv2.bitwise_and(
+            _line_fill_mask,
+            cv2.bitwise_and(
+                cv2.bitwise_not(_strict_mask),
+                ((_gray_la > _strict_thresh) & (_gray_la <= _core_thresh)).astype(np.uint8) * 255,
+            ),
+        )
+        _all_line_strokes = _line_hair_stroke_mask
+
         # Upscale for better contour quality
         if S > 1:
-            _h_la, _w_la = _binary_la.shape[:2]
-            _binary_la = cv2.resize(_binary_la, (_w_la * S, _h_la * S),
+            _h_la, _w_la = _line_fill_mask.shape[:2]
+            _binary_la = cv2.resize(_strict_fill, (_w_la * S, _h_la * S),
                                     interpolation=cv2.INTER_LINEAR)
             _binary_la = (_binary_la > 127).astype(np.uint8) * 255
+            _binary_la_fringe = cv2.resize(_hyst_fringe, (_w_la * S, _h_la * S),
+                                           interpolation=cv2.INTER_LINEAR)
+            _binary_la_fringe = (_binary_la_fringe > 127).astype(np.uint8) * 255
+        else:
+            _binary_la = _strict_fill.copy()
+            _binary_la_fringe = _hyst_fringe.copy()
 
         # Extract contours
         _cv_la, _hier_la = cv2.findContours(
             _binary_la, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        _cv_la_fringe, _hier_la_fringe = cv2.findContours(
+            _binary_la_fringe, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE,
         )
 
         # Determine line (darkest) and background (lightest) colors
@@ -716,64 +966,83 @@ def multilevel_vectorize(
         _darkest_ci = int(np.argmin(_gray_centers))
         _line_hex = _bgr_to_hex(centers_u[_darkest_ci])
 
-        # Group contours by hierarchy (outer + holes)
-        _la_paths: list[str] = []
-        _la_nodes = 0
-        if _hier_la is not None and len(_cv_la) > 0:
-            _hier0 = _hier_la[0]
+        def _fit_line_art_paths(_cv_contours, _hierarchy):
+            _paths: list[str] = []
+            _nodes = 0
+            if _hierarchy is None or len(_cv_contours) == 0:
+                return _paths, _nodes
+            _hier0 = _hierarchy[0]
             _groups_la: list[dict] = []
-            _outer_set: set[int] = set()
-            for idx in range(len(_cv_la)):
-                if _hier0[idx][3] == -1:  # outer contour
-                    _outer_set.add(idx)
+            for idx in range(len(_cv_contours)):
+                if _hier0[idx][3] == -1:
                     _groups_la.append({'outer': idx, 'holes': []})
             _outer_list = {g['outer']: g for g in _groups_la}
-            for idx in range(len(_cv_la)):
+            for idx in range(len(_cv_contours)):
                 parent = _hier0[idx][3]
                 if parent != -1 and parent in _outer_list:
                     _outer_list[parent]['holes'].append(idx)
 
-            # Sort by area, limit groups
             _groups_la.sort(
-                key=lambda g: cv2.contourArea(_cv_la[g['outer']]), reverse=True,
+                key=lambda g: cv2.contourArea(_cv_contours[g['outer']]), reverse=True,
             )
             _groups_la = _groups_la[:200]
 
-            # Filter tiny contours
-            _min_area_la = 2 * S * S  # smaller threshold for line art to preserve thin features
+            _min_area_la = max(S * S, 8)
             _groups_la = [
                 g for g in _groups_la
-                if cv2.contourArea(_cv_la[g['outer']]) >= _min_area_la
+                if cv2.contourArea(_cv_contours[g['outer']]) >= _min_area_la
             ]
 
             for g in _groups_la:
                 parts: list[str] = []
-                # Outer contour
-                _pts = _cv_la[g['outer']].squeeze(1).astype(np.float64)
+                _pts = _cv_contours[g['outer']].squeeze(1).astype(np.float64)
                 if len(_pts) < 3:
                     continue
-                # Skip smoothing for line art — binary threshold contours are already clean
-                _pts = _pts / S  # back to original image space
-                _d = _fit_contour(_pts, simplify_epsilon * 0.2, max_error * 0.3,
+                _pts = _pts / S
+                _d = _fit_contour(_pts, simplify_epsilon * 0.14, max_error * 0.22,
                                   corner_threshold, line_tolerance * 0.6)
                 if not _d:
                     continue
                 parts.append(_d)
-                # Holes
                 for hi in g['holes']:
-                    _hpts = _cv_la[hi].squeeze(1).astype(np.float64)
+                    _hpts = _cv_contours[hi].squeeze(1).astype(np.float64)
                     if len(_hpts) < 3:
                         continue
-                    # Skip smoothing for line art holes too
                     _hpts = _hpts / S
-                    _hd = _fit_contour(_hpts, simplify_epsilon * 0.2, max_error * 0.3,
+                    _hd = _fit_contour(_hpts, simplify_epsilon * 0.14, max_error * 0.22,
                                        corner_threshold, line_tolerance * 0.6)
                     if _hd:
                         parts.append(_hd)
                 combined = " ".join(parts)
-                _la_paths.append(combined)
-                _la_nodes += (combined.count("C") + combined.count("L")
-                              + combined.count("M"))
+                _paths.append(combined)
+                _nodes += (combined.count("C") + combined.count("L")
+                           + combined.count("M"))
+            return _paths, _nodes
+
+        # Group contours by hierarchy (outer + holes)
+        _la_paths: list[str] = []
+        _la_nodes = 0
+        _la_paths, _la_nodes = _fit_line_art_paths(_cv_la, _hier_la)
+        _la_fringe_paths, _la_fringe_nodes = _fit_line_art_paths(_cv_la_fringe, _hier_la_fringe)
+        _la_hair_stroke = _process_stroke_mask(
+            (_line_hair_stroke_mask > 0).astype(np.uint8),
+            scale=S,
+            simplify_epsilon=simplify_epsilon * 0.15,
+            max_error=max_error * 0.25,
+            corner_threshold=corner_threshold,
+            line_tolerance=line_tolerance * 0.5,
+            min_branch_length=1,
+        )
+        if _la_hair_stroke is None:
+            _la_hair_stroke_paths, _la_hair_stroke_widths = [], []
+        else:
+            _la_hair_stroke_paths, _la_hair_stroke_widths = _la_hair_stroke
+        _la_stroke_paths = _la_hair_stroke_paths
+        _la_stroke_widths = _la_hair_stroke_widths
+        _la_stroke_nodes = sum(
+            path_d.count("C") + path_d.count("L") + path_d.count("M")
+            for path_d in _la_stroke_paths
+        )
 
         _t_la_end = time.time()
 
@@ -783,14 +1052,27 @@ def multilevel_vectorize(
             color=_line_hex,
             shapes=None,
         )
+        _layers = []
+        if _la_fringe_paths:
+            _layers.append(VectorLayer(
+                paths=_la_fringe_paths,
+                opacities=[0.55] * len(_la_fringe_paths),
+                color=_line_hex,
+                shapes=None,
+            ))
+        _layers.append(_la_layer)
         return MultilevelResult(
-            layers=[_la_layer],
-            stroke_layers=[],
+            layers=_layers,
+            stroke_layers=[StrokeLayer(
+                paths=_la_stroke_paths,
+                widths=_la_stroke_widths,
+                color=_line_hex,
+            )] if _la_stroke_paths else [],
             width=w,
             height=h,
             background_color=bg_hex,
-            path_count=len(_la_paths),
-            node_count=_la_nodes,
+            path_count=len(_la_paths) + len(_la_fringe_paths) + len(_la_stroke_paths),
+            node_count=_la_nodes + _la_fringe_nodes + _la_stroke_nodes,
             gradient_defs=None,
             is_line_art=True,
         )
@@ -804,14 +1086,13 @@ def multilevel_vectorize(
         _local_paths = 0
         _local_nodes = 0
         _local_curves_time = 0.0
-        color_hex = _bgr_to_hex(centers_u[cluster_idx])
+        color_hex = _bgr_to_hex(render_centers_u[cluster_idx])
         mediator = cluster_mediator_score[cluster_idx]
-        lightness = cluster_lightness[cluster_idx]
         _t_cl = time.time()
 
-        # --- Archimedes soft membership (using pre-computed nearest-two) ---
+        # --- Archimedes soft membership (using nearby competing clusters) ---
         d_k = dist_map[:, :, cluster_idx]
-        d_other = np.where(_nn1_idx == cluster_idx, _nn2_dist, _nn1_dist)
+        d_other = _soft_competing_distance(cluster_idx, _nn_idx, _nn_dist)
 
         denom = d_k + d_other
         denom = np.where(denom < 1e-10, 1e-10, denom)
@@ -853,7 +1134,7 @@ def multilevel_vectorize(
         # contours toward their centre, reducing stroke thickening.
         # Higher K → more, smaller clusters → need lower iso to preserve features.
         # Base iso 0.44, with K-adaptive reduction for high cluster counts.
-        _k_iso_adj = max(0.0, (K - 6) * 0.005)  # +0.005 per cluster above 6
+        _k_iso_adj = min(0.02, max(0.0, (K - 8) * 0.0025))
         # Chrominance-aware iso: saturated/chromatic clusters (warm yellows,
         # reds, cyans) tend to lose boundary pixels to adjacent achromatic
         # clusters in the soft field. Lower iso slightly to expand their contours.
@@ -861,9 +1142,59 @@ def multilevel_vectorize(
         _cl_chroma = float(np.sqrt((float(_cl_lab[1]) - 128) ** 2 + (float(_cl_lab[2]) - 128) ** 2))
         _chroma_iso_adj = min(0.015, max(0.0, (_cl_chroma - 20) * 0.0005))
         if cluster_is_thin[cluster_idx]:
-            iso_level = 0.44 - _k_iso_adj * 0.5
+            iso_level = 0.45 - _k_iso_adj * 0.5
         else:
-            iso_level = 0.40 - _k_iso_adj - _chroma_iso_adj
+            iso_level = 0.42 - _k_iso_adj - _chroma_iso_adj
+            if _enable_warm_fill_relax and cluster_large_chromatic_fill[cluster_idx]:
+                iso_level -= 0.008
+            elif _sat_frac > 0.50 and K_render >= 10 and not _enable_warm_fill_relax and int(centers_hsv_render[cluster_idx, 1]) >= 70:
+                iso_level += 0.008
+            # Large prominent clusters: relax iso slightly to preserve major features
+            _cluster_area_frac_iso = float(cluster_pix_count[cluster_idx]) / max(1, total_pixels)
+            if _cluster_area_frac_iso >= 0.05 and not cluster_is_thin[cluster_idx]:
+                iso_level -= 0.005
+
+        if _warm_debug and cluster_idx in warm_debug_clusters:
+            label_mask = labels == cluster_idx
+            if np.any(label_mask):
+                src_h = source_hsv[:, :, 0]
+                src_s = source_hsv[:, :, 1]
+                src_v = source_hsv[:, :, 2]
+                dark_warm_mask = label_mask & (src_s >= 35) & (src_h >= 12) & (src_h <= 45) & (src_v <= 170)
+                own_keep = int(np.count_nonzero(label_mask & (soft_raw > iso_level)))
+                own_total = int(np.count_nonzero(label_mask))
+                dark_keep = int(np.count_nonzero(dark_warm_mask & (soft_raw > iso_level)))
+                dark_total = int(np.count_nonzero(dark_warm_mask))
+                competitor_idx = warm_debug_primary_competitor.get(cluster_idx, -1)
+                competitor_desc = f"k{competitor_idx}" if competitor_idx >= 0 else "none"
+                if competitor_idx >= 0:
+                    comp_dist = dist_map[:, :, competitor_idx][dark_warm_mask] if dark_total else np.empty(0, dtype=np.float32)
+                else:
+                    comp_dist = np.empty(0, dtype=np.float32)
+                own_dist = d_k[dark_warm_mask] if dark_total else np.empty(0, dtype=np.float32)
+                mean_own = float(own_dist.mean()) if own_dist.size else 0.0
+                mean_comp = float(comp_dist.mean()) if comp_dist.size else 0.0
+                print(
+                    f"[WARM] k{cluster_idx} iso={iso_level:.3f} keep={own_keep}/{own_total} "
+                    f"dark_keep={dark_keep}/{dark_total} competitor={competitor_desc} "
+                    f"mean_d_self={mean_own:.2f} mean_d_comp={mean_comp:.2f} "
+                    f"thin={int(cluster_is_thin[cluster_idx])} thick={cluster_mean_thick[cluster_idx]:.2f} "
+                    f"interior={cluster_interior_frac[cluster_idx]:.3f} mediator={mediator:.3f}"
+                )
+        elif _cluster_debug:
+            label_mask = labels == cluster_idx
+            if np.any(label_mask):
+                own_keep = int(np.count_nonzero(label_mask & (soft_raw > iso_level)))
+                own_total = int(np.count_nonzero(label_mask))
+                keep_ratio = own_keep / max(1, own_total)
+                if own_total >= max(10000, int(total_pixels * 0.002)):
+                    center_hsv = centers_hsv_render[cluster_idx]
+                    print(
+                        f"[CLUSTER] k{cluster_idx} keep={own_keep}/{own_total} ratio={keep_ratio:.3f} "
+                        f"iso={iso_level:.3f} thin={int(cluster_is_thin[cluster_idx])} "
+                        f"thick={cluster_mean_thick[cluster_idx]:.2f} interior={cluster_interior_frac[cluster_idx]:.3f} "
+                        f"mediator={mediator:.3f} hsv=({int(center_hsv[0])},{int(center_hsv[1])},{int(center_hsv[2])})"
+                    )
         iso_map = _build_local_iso_map(
             iso_level,
             hard_edge_up,
@@ -876,6 +1207,8 @@ def multilevel_vectorize(
         layer_paths: list[str] = []
         layer_opacities: list[float] = []
         layer_shapes: list[str] | None = None
+        layer_path_fills: list[str] = []
+        cluster_gradient_regions = single_gradient_regions.get(cluster_idx)
         # Fill tiny gaps in narrow features (e.g. thin letter legs)
         # Use minimal 3x3 kernel to avoid inflating junctions.
         if mediator < 0.3:
@@ -932,11 +1265,25 @@ def multilevel_vectorize(
         # Dynamic budget: aim for total fitting time < 7s across all clusters.
         # More clusters → fewer groups per cluster to stay in budget.
         pixel_count = h * w
-        _fitting_budget_groups = max(300, 1000 // max(K_render, 1))
+        _cluster_area_frac = float(cluster_pix_count[cluster_idx]) / max(1, total_pixels)
+        _cluster_sat = int(centers_hsv_render[cluster_idx, 1])
+        _texture_rich_cluster = _cluster_sat >= 55 and _cluster_area_frac >= 0.006
+        _fitting_budget_groups = max(400, 1600 // max(K_render, 1))
         if pixel_count < 4_000_000:
-            MAX_GROUPS = min(1000, _fitting_budget_groups)
+            MAX_GROUPS = min(1400, _fitting_budget_groups)
         else:
             MAX_GROUPS = _fitting_budget_groups
+        if _cluster_area_frac >= 0.05:
+            MAX_GROUPS += 900
+        elif _cluster_area_frac >= 0.02:
+            MAX_GROUPS += 450
+        elif _cluster_area_frac >= 0.01:
+            MAX_GROUPS += 200
+        if _texture_rich_cluster:
+            MAX_GROUPS += 250
+        if cluster_is_thin[cluster_idx] and _cluster_area_frac >= 0.003:
+            MAX_GROUPS += 150
+        MAX_GROUPS = min(2200, MAX_GROUPS)
         if len(_contour_groups) > MAX_GROUPS:
             _raw_areas = [abs(cv2.contourArea(_cv_contours[g[0]])) / (S * S)
                           for g in _contour_groups]
@@ -945,6 +1292,8 @@ def multilevel_vectorize(
 
         # Convert contour groups to xy arrays, fit Béziers, build paths
         core_parts_per_group: list[list[str]] = []
+        group_bboxes: list[tuple[float, float, float, float]] = []
+        group_probe_points: list[np.ndarray] = []
         total_group_area: list[float] = []
         _t_cluster_fit_start = time.time()
         _fit_budget_exceeded = False
@@ -969,14 +1318,23 @@ def multilevel_vectorize(
                 elongation = (perim_raw * perim_raw) / (area_raw + 1)
                 # Uniform area multiplier — preserve detail at all sizes
                 _area_mult = 1.0
+                if _texture_rich_cluster:
+                    _area_mult *= 0.75
+                elif _cluster_area_frac >= 0.02:
+                    _area_mult *= 0.85
+                # Dense-texture clusters: raise area floor to cull angular
+                # micro-fragments (e.g. forest canopy shards)
+                if len(_contour_groups) > 300:
+                    _area_mult *= 1.5
                 if elongation > 50 and perim_raw > 8:
                     # Elongated thin shape — likely a line, use lower threshold
                     min_frag_area = min_contour_area * 0.5 * _area_mult
                 elif cluster_is_thin[cluster_idx]:
                     # Thin cluster — preserve more fragments
-                    min_frag_area = min_contour_area * _area_mult
+                    min_frag_area = min_contour_area * 0.8 * _area_mult
                 else:
-                    min_frag_area = min_contour_area * 1.5 * _area_mult
+                    # Non-thin clusters: slightly tighter filtering to reduce noise
+                    min_frag_area = min_contour_area * 1.3 * _area_mult
                 if area_raw < min_frag_area:
                     continue
 
@@ -1010,10 +1368,14 @@ def multilevel_vectorize(
                 # preserve detail; wide regions get heavy sigma to eliminate
                 # polygon faceting.
                 if cluster_is_thin[cluster_idx]:
-                    contour_sigma = (0.3 + t * 0.3) * S
+                    contour_sigma = (0.25 + t * 0.25) * S
                 else:
-                    contour_sigma = (0.4 + t * 0.5) * S
-                contour_sigma = max(contour_sigma, 0.8)
+                    contour_sigma = (0.38 + t * 0.46) * S
+                    # Extra smoothing for dense-texture clusters (many groups
+                    # = angular fragment-rich areas like forest canopy)
+                    if len(_contour_groups) > 300:
+                        contour_sigma *= 1.4
+                contour_sigma = max(contour_sigma, 0.7)
 
                 xy = _smooth_contour(xy, sigma=contour_sigma)
                 xy = xy / S
@@ -1034,7 +1396,7 @@ def multilevel_vectorize(
                 is_hole = (_hierarchy is not None and _hierarchy[0][ci][3] != -1)
                 has_holes = len(group) > 1
                 if not is_hole:
-                    if not cluster_is_thin[cluster_idx] and not has_holes:
+                    if cluster_gradient_regions is None and not cluster_is_thin[cluster_idx] and not has_holes:
                         shape_svg = _detect_shape(xy, min_area=min_contour_area * 4)
                         if shape_svg is not None:
                             if layer_shapes is None:
@@ -1069,15 +1431,418 @@ def multilevel_vectorize(
 
             if group_parts:
                 core_parts_per_group.append(group_parts)
+                _outer = _cv_contours[group[0]].reshape(-1, 2).astype(np.float64) / S
+                group_bboxes.append((
+                    float(np.min(_outer[:, 0])),
+                    float(np.min(_outer[:, 1])),
+                    float(np.max(_outer[:, 0])),
+                    float(np.max(_outer[:, 1])),
+                ))
+                if len(_outer) > 12:
+                    _probe_idx = np.linspace(0, len(_outer) - 1, 12, dtype=int)
+                    _probes = _outer[_probe_idx]
+                else:
+                    _probes = _outer
+                group_probe_points.append(_probes)
                 total_group_area.append(group_area)
 
+        def _score_gradient_region_match(
+            region: GradientRegionAssignment,
+            group_bbox: tuple[float, float, float, float],
+            probe_pts: np.ndarray,
+        ) -> tuple[float, str]:
+            gx0, gy0, gx1, gy1 = group_bbox
+            rx0, ry0, rx1, ry1 = region.bbox
+            overlap_x0 = max(gx0, rx0)
+            overlap_y0 = max(gy0, ry0)
+            overlap_x1 = min(gx1, rx1)
+            overlap_y1 = min(gy1, ry1)
+            if overlap_x1 <= overlap_x0 or overlap_y1 <= overlap_y0:
+                return -1.0, region.fill_ref
+
+            group_w = max(gx1 - gx0, 1e-6)
+            group_h = max(gy1 - gy0, 1e-6)
+            group_area = group_w * group_h
+            overlap_area = (overlap_x1 - overlap_x0) * (overlap_y1 - overlap_y0)
+
+            sample_points = [
+                (0.5 * (gx0 + gx1), 0.5 * (gy0 + gy1)),
+                (gx0 + group_w * 0.35, gy0 + group_h * 0.35),
+                (gx0 + group_w * 0.65, gy0 + group_h * 0.35),
+                (gx0 + group_w * 0.35, gy0 + group_h * 0.65),
+                (gx0 + group_w * 0.65, gy0 + group_h * 0.65),
+            ]
+
+            interior_hits = 0
+            center_in_mask = False
+            for sample_idx, (px, py) in enumerate(sample_points):
+                ix = int(np.clip(round(px), 0, w - 1))
+                iy = int(np.clip(round(py), 0, h - 1))
+                if region.mask[iy, ix]:
+                    interior_hits += 1
+                    if sample_idx == 0:
+                        center_in_mask = True
+
+            boundary_hits = 0
+            for px, py in probe_pts:
+                ix = int(np.clip(round(px), 0, w - 1))
+                iy = int(np.clip(round(py), 0, h - 1))
+                if region.mask[iy, ix]:
+                    boundary_hits += 1
+
+            score = 0.0
+            if center_in_mask:
+                score += 10.0
+            score += interior_hits * 3.0
+            score += boundary_hits * 0.75
+            score += min(3.0, 3.0 * overlap_area / group_area)
+            return score, region.fill_ref
+
+        def _compute_group_fill_hex(group: list[int], group_area: float) -> str:
+            if _sat_frac <= 0.25 or cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.001:
+                return color_hex
+
+            native_contours: list[np.ndarray] = []
+            x0 = w
+            y0 = h
+            x1 = 0
+            y1 = 0
+            for ci in group:
+                pts = _cv_contours[ci].reshape(-1, 2).astype(np.float32) / S
+                pts = np.round(pts).astype(np.int32)
+                if len(pts) < 3:
+                    continue
+                native_contours.append(pts)
+                x0 = min(x0, int(pts[:, 0].min()))
+                y0 = min(y0, int(pts[:, 1].min()))
+                x1 = max(x1, int(pts[:, 0].max()))
+                y1 = max(y1, int(pts[:, 1].max()))
+
+            if not native_contours or x1 <= x0 or y1 <= y0:
+                return color_hex
+
+            x0 = max(0, x0)
+            y0 = max(0, y0)
+            x1 = min(w - 1, x1)
+            y1 = min(h - 1, y1)
+            if x1 <= x0 or y1 <= y0:
+                return color_hex
+
+            roi_mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+            outer = (native_contours[0] - np.array([x0, y0], dtype=np.int32)).reshape(-1, 1, 2)
+            cv2.fillPoly(roi_mask, [outer], 255)
+            for hole in native_contours[1:]:
+                hole_pts = (hole - np.array([x0, y0], dtype=np.int32)).reshape(-1, 1, 2)
+                cv2.fillPoly(roi_mask, [hole_pts], 0)
+
+            roi_cluster = labels[y0:y1 + 1, x0:x1 + 1] == cluster_idx
+            sample_mask = (roi_mask > 0) & roi_cluster
+            if int(np.count_nonzero(sample_mask)) < 64:
+                return color_hex
+
+            samples = image_bgr[y0:y1 + 1, x0:x1 + 1][sample_mask].astype(np.float32)
+            group_color = _render_color_from_samples(samples, render_centers_u[cluster_idx].astype(np.float32))
+            return _bgr_to_hex(np.clip(np.round(group_color), 0, 255).astype(np.uint8))
+
+        def _try_group_gradient_fill(group: list[int], group_area: float) -> str | None:
+            if _sat_frac <= 0.25 or cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.004:
+                return None
+
+            native_contours: list[np.ndarray] = []
+            x0 = w
+            y0 = h
+            x1 = 0
+            y1 = 0
+            for ci in group:
+                pts = _cv_contours[ci].reshape(-1, 2).astype(np.float32) / S
+                pts = np.round(pts).astype(np.int32)
+                if len(pts) < 3:
+                    continue
+                native_contours.append(pts)
+                x0 = min(x0, int(pts[:, 0].min()))
+                y0 = min(y0, int(pts[:, 1].min()))
+                x1 = max(x1, int(pts[:, 0].max()))
+                y1 = max(y1, int(pts[:, 1].max()))
+
+            if not native_contours or x1 <= x0 or y1 <= y0:
+                return None
+
+            x0 = max(0, x0)
+            y0 = max(0, y0)
+            x1 = min(w - 1, x1)
+            y1 = min(h - 1, y1)
+            if x1 <= x0 or y1 <= y0:
+                return None
+
+            roi_mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+            outer = (native_contours[0] - np.array([x0, y0], dtype=np.int32)).reshape(-1, 1, 2)
+            cv2.fillPoly(roi_mask, [outer], 255)
+            for hole in native_contours[1:]:
+                hole_pts = (hole - np.array([x0, y0], dtype=np.int32)).reshape(-1, 1, 2)
+                cv2.fillPoly(roi_mask, [hole_pts], 0)
+
+            roi_cluster = labels[y0:y1 + 1, x0:x1 + 1] == cluster_idx
+            sample_mask = (roi_mask > 0) & roi_cluster
+            if int(np.count_nonzero(sample_mask)) < 256:
+                return None
+
+            ys_local, xs_local = np.where(sample_mask)
+            coords = np.column_stack([
+                xs_local.astype(np.float64) + x0,
+                ys_local.astype(np.float64) + y0,
+            ])
+            colors = image_bgr[y0:y1 + 1, x0:x1 + 1][sample_mask].astype(np.float64)
+            color_mean = colors.mean(axis=0)
+            centered = colors - color_mean
+            try:
+                cov = np.cov(centered.T)
+                eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            except np.linalg.LinAlgError:
+                return None
+
+            principal_idx = int(np.argmax(eigenvalues))
+            spread = float(np.sqrt(eigenvalues[principal_idx]))
+            if spread < 10.0 or spread > 120.0:
+                return None
+
+            projections = centered @ eigenvectors[:, principal_idx]
+            coord_mean = coords.mean(axis=0)
+            coords_c = coords - coord_mean
+            try:
+                spatial_cov = np.cov(coords_c.T, projections)
+            except Exception:
+                return None
+            if spatial_cov.shape != (3, 3):
+                return None
+            spatial_color_cov = spatial_cov[0:2, 2]
+            grad_dir = spatial_color_cov / (np.linalg.norm(spatial_color_cov) + 1e-10)
+            proj_spatial = coords_c @ grad_dir
+            p_min = float(proj_spatial.min())
+            p_max = float(proj_spatial.max())
+            if p_max - p_min < 40.0:
+                return None
+
+            try:
+                spatial_corr = float(np.corrcoef(proj_spatial, projections)[0, 1])
+            except Exception:
+                return None
+            if not np.isfinite(spatial_corr) or abs(spatial_corr) < 0.35:
+                return None
+
+            low_mask = proj_spatial < np.percentile(proj_spatial, 10)
+            high_mask = proj_spatial > np.percentile(proj_spatial, 90)
+            if low_mask.sum() < 12 or high_mask.sum() < 12:
+                return None
+
+            color_start = colors[low_mask].mean(axis=0)
+            color_end = colors[high_mask].mean(axis=0)
+            endpoint_dist = float(np.linalg.norm(color_end - color_start))
+            if endpoint_dist < 12.0:
+                return None
+
+            span = max(p_max - p_min, 1e-6)
+            t_vals = np.clip((proj_spatial - p_min) / span, 0.0, 1.0)
+            color_line = color_start[None, :] + (color_end - color_start)[None, :] * t_vals[:, None]
+            fit_residual = float(np.mean(np.linalg.norm(colors - color_line, axis=1)))
+            if fit_residual > max(18.0, endpoint_dist * 0.42):
+                return None
+
+            mid_mask = (t_vals >= 0.35) & (t_vals <= 0.65)
+            color_mid_hex = None
+            if mid_mask.sum() >= 12:
+                color_mid_hex = _bgr_to_hex(np.clip(np.round(colors[mid_mask].mean(axis=0)), 0, 255).astype(np.uint8))
+
+            gid = f"g{len(gradient_defs)}"
+            gradient_defs.append(GradientDef(
+                id=gid,
+                x1=float(np.clip(coord_mean[0] + grad_dir[0] * p_min, 0, w)),
+                y1=float(np.clip(coord_mean[1] + grad_dir[1] * p_min, 0, h)),
+                x2=float(np.clip(coord_mean[0] + grad_dir[0] * p_max, 0, w)),
+                y2=float(np.clip(coord_mean[1] + grad_dir[1] * p_max, 0, h)),
+                color_start=_bgr_to_hex(np.clip(np.round(color_start), 0, 255).astype(np.uint8)),
+                color_end=_bgr_to_hex(np.clip(np.round(color_end), 0, 255).astype(np.uint8)),
+                color_mid=color_mid_hex,
+            ))
+            return f"url(#{gid})"
+
+        def _extract_group_detail_overlays(group: list[int], group_area: float) -> list[tuple[str, str]]:
+            if _sat_frac <= 0.25 or cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.012:
+                return []
+
+            _cluster_sat = int(centers_hsv_render[cluster_idx, 1])
+            _is_texture_rich_sat = _cluster_sat >= 70 and _sat_frac > 0.55
+
+            native_contours: list[np.ndarray] = []
+            x0 = w
+            y0 = h
+            x1 = 0
+            y1 = 0
+            for ci in group:
+                pts = _cv_contours[ci].reshape(-1, 2).astype(np.float32) / S
+                pts = np.round(pts).astype(np.int32)
+                if len(pts) < 3:
+                    continue
+                native_contours.append(pts)
+                x0 = min(x0, int(pts[:, 0].min()))
+                y0 = min(y0, int(pts[:, 1].min()))
+                x1 = max(x1, int(pts[:, 0].max()))
+                y1 = max(y1, int(pts[:, 1].max()))
+
+            if not native_contours or x1 <= x0 or y1 <= y0:
+                return []
+
+            x0 = max(0, x0)
+            y0 = max(0, y0)
+            x1 = min(w - 1, x1)
+            y1 = min(h - 1, y1)
+            if x1 <= x0 or y1 <= y0:
+                return []
+
+            roi_mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+            outer = (native_contours[0] - np.array([x0, y0], dtype=np.int32)).reshape(-1, 1, 2)
+            cv2.fillPoly(roi_mask, [outer], 255)
+            for hole in native_contours[1:]:
+                hole_pts = (hole - np.array([x0, y0], dtype=np.int32)).reshape(-1, 1, 2)
+                cv2.fillPoly(roi_mask, [hole_pts], 0)
+
+            roi_cluster = labels[y0:y1 + 1, x0:x1 + 1] == cluster_idx
+            sample_mask = (roi_mask > 0) & roi_cluster
+            sample_count = int(np.count_nonzero(sample_mask))
+            if sample_count < (250 if _is_texture_rich_sat else 400):
+                return []
+
+            roi_gray = cv2.cvtColor(image_bgr[y0:y1 + 1, x0:x1 + 1], cv2.COLOR_BGR2GRAY)
+            gray_samples = roi_gray[sample_mask].astype(np.float32)
+            gray_span = float(np.percentile(gray_samples, 90) - np.percentile(gray_samples, 10))
+            if gray_span < (15.0 if _is_texture_rich_sat else 24.0):
+                return []
+
+            overlays: list[tuple[str, str]] = []
+            _max_overlays = 4 if _is_texture_rich_sat else 2
+            _components_per_polarity = 2 if _is_texture_rich_sat else 1
+            for detail_mask_raw in (
+                roi_gray <= np.percentile(gray_samples, 34),
+                roi_gray >= np.percentile(gray_samples, 66),
+            ):
+                detail_mask = (detail_mask_raw & sample_mask).astype(np.uint8)
+                if int(np.count_nonzero(detail_mask)) < sample_count * 0.08:
+                    continue
+                cc_count, cc_labels = cv2.connectedComponents(detail_mask)
+                if cc_count <= 1:
+                    continue
+                cc_sizes = np.bincount(cc_labels.ravel())[1:]
+                if len(cc_sizes) == 0:
+                    continue
+                component_order = np.argsort(cc_sizes)[::-1]
+                for component_rank in component_order[:_components_per_polarity]:
+                    component_idx = int(component_rank) + 1
+                    component_size = int(cc_sizes[component_rank])
+                    if component_size < sample_count * 0.08 or component_size > sample_count * 0.72:
+                        continue
+                    largest_mask = (cc_labels == component_idx).astype(np.uint8)
+                    largest_mask = cv2.morphologyEx(
+                        largest_mask,
+                        cv2.MORPH_OPEN,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                    )
+                    if int(np.count_nonzero(largest_mask)) < sample_count * 0.06:
+                        continue
+
+                    detail_contours, detail_hierarchy = cv2.findContours(
+                        (largest_mask * 255).astype(np.uint8),
+                        cv2.RETR_CCOMP,
+                        cv2.CHAIN_APPROX_SIMPLE,
+                    )
+                    if detail_hierarchy is None or len(detail_contours) == 0:
+                        continue
+
+                    for detail_idx in range(len(detail_contours)):
+                        if detail_hierarchy[0][detail_idx][3] != -1:
+                            continue
+                        contour = detail_contours[detail_idx].squeeze(1).astype(np.float64)
+                        if len(contour) < 10:
+                            continue
+                        area_real = abs(cv2.contourArea(detail_contours[detail_idx]))
+                        if area_real < min_contour_area * 8:
+                            continue
+                        contour[:, 0] += x0
+                        contour[:, 1] += y0
+                        contour = _smooth_contour(contour, sigma=max(0.8, 0.28 * S))
+                        d_detail = _fit_contour(
+                            contour,
+                            simplify_epsilon * 0.8,
+                            max_error * 0.8,
+                            corner_threshold,
+                            line_tolerance,
+                        )
+                        if not d_detail:
+                            continue
+                        detail_pixels = image_bgr[y0:y1 + 1, x0:x1 + 1][largest_mask > 0].astype(np.float32)
+                        if len(detail_pixels) < 32:
+                            continue
+                        detail_color = _render_color_from_samples(
+                            detail_pixels,
+                            render_centers_u[cluster_idx].astype(np.float32),
+                        )
+                        detail_hex = _bgr_to_hex(np.clip(np.round(detail_color), 0, 255).astype(np.uint8))
+                        overlays.append((d_detail, detail_hex))
+                        break
+                    if len(overlays) >= _max_overlays:
+                        break
+            return overlays[:_max_overlays]
+
         # Each group becomes one SVG path (outer + holes = evenodd cutouts)
-        for group_parts in core_parts_per_group:
+        cluster_fill_ref = gradient_fill_map.get(cluster_idx)
+        group_gradient_scores: list[tuple[float, str]] = []
+        for group, group_parts, group_bbox, probe_pts, group_area in zip(
+            _contour_groups,
+            core_parts_per_group,
+            group_bboxes,
+            group_probe_points,
+            total_group_area,
+        ):
             combined = " ".join(group_parts)
             layer_paths.append(combined)
             layer_opacities.append(1.0)
+            solid_fill_hex = _compute_group_fill_hex(group, group_area)
+            local_gradient_fill = _try_group_gradient_fill(group, group_area)
+            if cluster_gradient_regions:
+                fill_ref = local_gradient_fill or solid_fill_hex
+                best_score = -1.0
+                for region in cluster_gradient_regions:
+                    region_score, region_fill_ref = _score_gradient_region_match(region, group_bbox, probe_pts)
+                    if region_score > best_score:
+                        best_score = region_score
+                        fill_ref = region_fill_ref
+                if best_score < 6.0:
+                    fill_ref = local_gradient_fill or solid_fill_hex
+                group_gradient_scores.append((best_score, fill_ref))
+                layer_path_fills.append(fill_ref)
+            elif cluster_fill_ref is not None:
+                layer_path_fills.append(cluster_fill_ref)
+            else:
+                layer_path_fills.append(local_gradient_fill or solid_fill_hex)
             _local_paths += 1
             _local_nodes += combined.count("C") + combined.count("L") + combined.count("M")
+
+            for detail_path, detail_fill in _extract_group_detail_overlays(group, group_area):
+                layer_paths.append(detail_path)
+                layer_opacities.append(1.0)
+                layer_path_fills.append(detail_fill)
+                _local_paths += 1
+                _local_nodes += detail_path.count("C") + detail_path.count("L") + detail_path.count("M")
+
+        if cluster_gradient_regions and layer_path_fills and not any(fill.startswith("url(#") for fill in layer_path_fills):
+            _best_group_idx = -1
+            _best_group_score = 0.0
+            _best_group_fill = ""
+            for _group_idx, (_score, _fill_ref) in enumerate(group_gradient_scores):
+                if _score > _best_group_score:
+                    _best_group_idx = _group_idx
+                    _best_group_score = _score
+                    _best_group_fill = _fill_ref
+            if _best_group_idx >= 0 and _best_group_score >= 4.0:
+                layer_path_fills[_best_group_idx] = _best_group_fill
 
         # Stroke-mode rendering is available for very thin clusters but
         # currently disabled — fill + adaptive iso handles thin features
@@ -1090,20 +1855,19 @@ def multilevel_vectorize(
 
         # Build fill layer
         if (layer_paths or layer_shapes) and not used_stroke:
-            # Use gradient fill if this cluster was detected as a gradient zone
-            fill_ref = gradient_fill_map.get(cluster_idx, color_hex)
             return (VectorLayer(
                 paths=layer_paths,
                 opacities=layer_opacities,
-                color=fill_ref,
+                color=color_hex,
                 shapes=layer_shapes,
+                path_fills=layer_path_fills if layer_path_fills else None,
             ), _local_paths, _local_nodes, _local_curves_time)
         return None
 
     # --- Parallel cluster processing ---
     _cluster_order = [ci for ci in order if ci != bg_cluster]
 
-    _n_workers = min(len(_cluster_order), 8) if len(_cluster_order) > 1 else 1
+    _n_workers = 1
     if _n_workers > 1:
         with ThreadPoolExecutor(max_workers=_n_workers) as _executor:
             _cluster_results = list(_executor.map(_process_cluster, _cluster_order))
@@ -1150,22 +1914,49 @@ def generate_svg(
         f'viewBox="0 0 {w} {h}" width="{w}" height="{h}">',
     ]
 
+    used_gradient_ids: set[str] = set()
+    for layer in result.layers:
+        if layer.color.startswith("url(#") and layer.color.endswith(")"):
+            used_gradient_ids.add(layer.color[5:-1])
+        if layer.path_fills:
+            for fill_ref in layer.path_fills:
+                if fill_ref.startswith("url(#") and fill_ref.endswith(")"):
+                    used_gradient_ids.add(fill_ref[5:-1])
+
+    active_gradient_defs = [
+        gd for gd in (result.gradient_defs or [])
+        if gd.id in used_gradient_ids
+    ]
+
     # Emit gradient definitions if present
-    if result.gradient_defs:
+    if active_gradient_defs:
         parts.append('<defs>')
-        for gd in result.gradient_defs:
+        for gd in active_gradient_defs:
             stops = f'<stop offset="0%" stop-color="{gd.color_start}"/>'
             if gd.color_mid:
                 stops += f'<stop offset="50%" stop-color="{gd.color_mid}"/>'
             stops += f'<stop offset="100%" stop-color="{gd.color_end}"/>'
-            parts.append(
-                f'<linearGradient id="{gd.id}" '
-                f'x1="{gd.x1:.1f}" y1="{gd.y1:.1f}" '
-                f'x2="{gd.x2:.1f}" y2="{gd.y2:.1f}" '
-                f'gradientUnits="userSpaceOnUse">'
-                f'{stops}'
-                f'</linearGradient>'
-            )
+            if gd.kind == "radial" and gd.cx is not None and gd.cy is not None and gd.r is not None:
+                _fx = gd.fx if gd.fx is not None else gd.cx
+                _fy = gd.fy if gd.fy is not None else gd.cy
+                parts.append(
+                    f'<radialGradient id="{gd.id}" '
+                    f'cx="{gd.cx:.1f}" cy="{gd.cy:.1f}" '
+                    f'r="{gd.r:.1f}" '
+                    f'fx="{_fx:.1f}" fy="{_fy:.1f}" '
+                    f'gradientUnits="userSpaceOnUse">'
+                    f'{stops}'
+                    f'</radialGradient>'
+                )
+            else:
+                parts.append(
+                    f'<linearGradient id="{gd.id}" '
+                    f'x1="{gd.x1:.1f}" y1="{gd.y1:.1f}" '
+                    f'x2="{gd.x2:.1f}" y2="{gd.y2:.1f}" '
+                    f'gradientUnits="userSpaceOnUse">'
+                    f'{stops}'
+                    f'</linearGradient>'
+                )
         parts.append('</defs>')
 
     if not remove_background:
@@ -1180,17 +1971,18 @@ def generate_svg(
         # (faintest) to innermost (full opacity).  Each successive ring
         # overpaints the previous, creating a graduated transition that
         # reconstructs the anti-aliased gradient.
-        for path_d, opacity in zip(layer.paths, layer.opacities):
+        for idx, (path_d, opacity) in enumerate(zip(layer.paths, layer.opacities)):
             if not path_d:
                 continue
+            fill_ref = layer.path_fills[idx] if layer.path_fills and idx < len(layer.path_fills) else layer.color
             if opacity >= 1.0:
                 parts.append(
-                    f'<path d="{path_d}" fill="{layer.color}"'
+                    f'<path d="{path_d}" fill="{fill_ref}"'
                     f' fill-rule="evenodd" shape-rendering="{_shape_render}"/>'
                 )
             else:
                 parts.append(
-                    f'<path d="{path_d}" fill="{layer.color}"'
+                    f'<path d="{path_d}" fill="{fill_ref}"'
                     f' fill-rule="evenodd" opacity="{opacity:.2f}"'
                     f' shape-rendering="{_shape_render}"/>'
                 )
@@ -1230,121 +2022,500 @@ def _detect_gradients(
     h: int,
     gradient_defs: list,
     gradient_fill_map: dict,
+    single_gradient_regions: dict,
     min_region_pct: float = 2.0,
     color_dist_range: tuple[float, float] = (25.0, 150.0),
 ) -> None:
     """Detect gradient regions between adjacent clusters via PCA on pixel colors.
 
-    For each cluster covering >min_region_pct of the image, checks if the
-    source pixels within that cluster span a significant color range along
-    a principal axis.  If so, creates a linearGradient definition.
 
     Modifies gradient_defs and gradient_fill_map in-place.
     """
     K = len(centers_f)
     total_px = h * w
     src_f = source_bgr.astype(np.float64)
+    src_gray = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    src_gray_blur = cv2.GaussianBlur(src_gray, (0, 0), sigmaX=3.0)
     grad_id = 0
+    _diag = os.environ.get("SVG_GRADIENT_DEBUG") == "1"
+    _diag_counts: dict[str, int] = {
+        "pair_candidates": 0,
+        "pair_accept": 0,
+        "single_candidates": 0,
+        "single_accept": 0,
+        "reject_small": 0,
+        "reject_cov": 0,
+        "reject_spread": 0,
+        "reject_short": 0,
+        "reject_corr": 0,
+        "reject_endpoints": 0,
+        "reject_endpoint_dist": 0,
+        "reject_texture": 0,
+        "reject_pair_hue": 0,
+        "reject_pair_cc": 0,
+        "reject_single_cc": 0,
+    }
+    _diag_corr_samples: list[tuple[int, int, float]] = []
+    _diag_accept_regions: list[str] = []
+    _diag_component_candidates: list[str] = []
+    _diag_reject_regions: list[str] = []
+    _diag_radial_regions: list[str] = []
 
-    for k in range(K):
-        if k == bg_cluster:
-            continue
-        mask = labels == k
+    def _diag_reject(diag_label: str | None, reason: str) -> None:
+        if _diag and diag_label and len(_diag_reject_regions) < 24:
+            _diag_reject_regions.append(f"{diag_label}:{reason}")
+
+    def _fit_gradient_region(
+        mask: np.ndarray,
+        seed: int,
+        min_region_pct_override: float | None = None,
+        diag_label: str | None = None,
+    ) -> GradientDef | None:
         pix_count = int(np.count_nonzero(mask))
-        if pix_count < total_px * min_region_pct / 100.0:
-            continue
+        _min_region_pct = min_region_pct if min_region_pct_override is None else min_region_pct_override
+        if pix_count < total_px * _min_region_pct / 100.0:
+            _diag_counts["reject_small"] += 1
+            _diag_reject(diag_label, "small")
+            return None
 
-        # Sample source pixels in this cluster
         ys, xs = np.where(mask)
         if len(ys) > 8000:
-            rng = np.random.default_rng(k)
+            rng = np.random.default_rng(seed)
             idx = rng.choice(len(ys), 8000, replace=False)
             ys_s, xs_s = ys[idx], xs[idx]
         else:
             ys_s, xs_s = ys, xs
-        colors = src_f[ys_s, xs_s]  # Nx3
+        colors = src_f[ys_s, xs_s]
 
-        # PCA on the colors to find dominant color axis
         color_mean = colors.mean(axis=0)
+        mean_hsv = cv2.cvtColor(
+            np.clip(color_mean, 0, 255).astype(np.uint8).reshape(1, 1, 3),
+            cv2.COLOR_BGR2HSV,
+        )[0, 0]
+        _warm_mid_sat = 5 <= int(mean_hsv[0]) <= 25 and 25 <= int(mean_hsv[1]) <= 140
+        _small_warm_region = _warm_mid_sat and pix_count < total_px * 0.02
+        coords = np.column_stack([xs_s.astype(np.float64), ys_s.astype(np.float64)])
+        gray_vals = src_gray_blur[ys_s, xs_s]
+
+        def _try_small_warm_radial_gradient() -> GradientDef | None:
+            if not _small_warm_region:
+                return None
+
+            bright_mask = gray_vals >= np.percentile(gray_vals, 82)
+            dark_mask = gray_vals <= np.percentile(gray_vals, 18)
+            if bright_mask.sum() < 5 or dark_mask.sum() < 5:
+                if _diag and diag_label and len(_diag_radial_regions) < 24:
+                    _diag_radial_regions.append(f"{diag_label}:radial_endpoints")
+                return None
+
+            bright_center = coords[bright_mask].mean(axis=0)
+            radial_dist = np.linalg.norm(coords - bright_center[None, :], axis=1)
+            radial_span = float(np.percentile(radial_dist, 95))
+            if radial_span < 8.0:
+                if _diag and diag_label and len(_diag_radial_regions) < 24:
+                    _diag_radial_regions.append(f"{diag_label}:radial_span<{radial_span:.1f}")
+                return None
+
+            inner_cut = np.percentile(radial_dist, 24)
+            outer_cut = np.percentile(radial_dist, 76)
+            inner_mask = radial_dist <= inner_cut
+            outer_mask = radial_dist >= outer_cut
+            if inner_mask.sum() < 5 or outer_mask.sum() < 5:
+                if _diag and diag_label and len(_diag_radial_regions) < 24:
+                    _diag_radial_regions.append(f"{diag_label}:radial_masks")
+                return None
+
+            color_inner = colors[inner_mask].mean(axis=0)
+            color_outer = colors[outer_mask].mean(axis=0)
+            if dark_mask.sum() >= 5:
+                color_outer_dark = colors[dark_mask].mean(axis=0)
+                if np.linalg.norm(color_outer_dark - color_inner) > np.linalg.norm(color_outer - color_inner):
+                    color_outer = color_outer_dark
+            endpoint_dist = float(np.linalg.norm(color_outer - color_inner))
+            if endpoint_dist < 10.0:
+                if _diag and diag_label and len(_diag_radial_regions) < 24:
+                    _diag_radial_regions.append(f"{diag_label}:radial_endpoint<{endpoint_dist:.1f}")
+                return None
+
+            t_vals_radial = np.clip(radial_dist / max(radial_span, 1e-6), 0.0, 1.0)
+            color_radial = color_inner[None, :] + (color_outer - color_inner)[None, :] * t_vals_radial[:, None]
+            radial_fit = float(np.mean(np.linalg.norm(colors - color_radial, axis=1)))
+            radial_fit_thresh = max(14.0, endpoint_dist * 0.34) * 1.90
+            if radial_fit > radial_fit_thresh:
+                if _diag and diag_label and len(_diag_radial_regions) < 24:
+                    _diag_radial_regions.append(f"{diag_label}:radial_fit:{radial_fit:.1f}>{radial_fit_thresh:.1f}")
+                return None
+
+            mid_mask = (t_vals_radial >= 0.35) & (t_vals_radial <= 0.65)
+            color_mid_hex = None
+            if mid_mask.sum() >= 5:
+                color_mid = colors[mid_mask].mean(axis=0)
+                color_mid_hex = _bgr_to_hex(np.clip(color_mid, 0, 255).astype(np.uint8))
+
+            nonlocal grad_id
+            gid = f"g{grad_id}"
+            grad_id += 1
+            region_center = coords.mean(axis=0)
+            radius = float(np.percentile(radial_dist, 92))
+            if _diag and diag_label and len(_diag_radial_regions) < 24:
+                _diag_radial_regions.append(f"{diag_label}:radial_ok:r={radius:.1f}")
+            return GradientDef(
+                id=gid,
+                x1=float(bright_center[0]), y1=float(bright_center[1]),
+                x2=float(region_center[0]), y2=float(region_center[1]),
+                kind="radial",
+                cx=float(np.clip(region_center[0], 0, w)),
+                cy=float(np.clip(region_center[1], 0, h)),
+                r=float(np.clip(radius, 1.0, max(w, h))),
+                fx=float(np.clip(bright_center[0], 0, w)),
+                fy=float(np.clip(bright_center[1], 0, h)),
+                color_start=_bgr_to_hex(np.clip(color_inner, 0, 255).astype(np.uint8)),
+                color_end=_bgr_to_hex(np.clip(color_outer, 0, 255).astype(np.uint8)),
+                color_mid=color_mid_hex,
+            )
+
         centered = colors - color_mean
         try:
             cov = np.cov(centered.T)
             eigenvalues, eigenvectors = np.linalg.eigh(cov)
         except np.linalg.LinAlgError:
-            continue
+            _diag_counts["reject_cov"] += 1
+            _diag_reject(diag_label, "cov")
+            return None
 
-        # Largest eigenvalue = dominant color variation
-        principal_idx = np.argmax(eigenvalues)
+        principal_idx = int(np.argmax(eigenvalues))
         spread = float(np.sqrt(eigenvalues[principal_idx]))
-
-        # Only create gradient if color spread is significant
         if spread < color_dist_range[0] * 0.3 or spread > color_dist_range[1]:
-            continue
+            _diag_counts["reject_spread"] += 1
+            _diag_reject(diag_label, "spread")
+            return None
 
         principal_axis = eigenvectors[:, principal_idx]
-        projections = centered @ principal_axis  # scalar projection per pixel
+        projections = centered @ principal_axis
 
-        # Also project spatial coordinates to find gradient direction
-        coords = np.column_stack([xs_s.astype(np.float64), ys_s.astype(np.float64)])
         coord_mean = coords.mean(axis=0)
         coords_c = coords - coord_mean
 
-        # Correlate spatial position with color projection
         try:
             spatial_cov = np.cov(coords_c.T, projections)
         except Exception:
-            continue
+            _diag_counts["reject_cov"] += 1
+            _diag_reject(diag_label, "cov")
+            return None
         if spatial_cov.shape != (3, 3):
-            continue
-        # spatial_cov[0:2, 2] = covariance of (x, y) with color projection
+            _diag_counts["reject_cov"] += 1
+            _diag_reject(diag_label, "cov")
+            return None
         spatial_color_cov = spatial_cov[0:2, 2]
         grad_dir = spatial_color_cov / (np.linalg.norm(spatial_color_cov) + 1e-10)
 
-        # Gradient endpoints: project cluster bounding box onto gradient direction
         proj_spatial = coords_c @ grad_dir
         p_min, p_max = float(proj_spatial.min()), float(proj_spatial.max())
-        if p_max - p_min < 10:  # too short spatially
-            continue
+        if p_max - p_min < 10:
+            _diag_counts["reject_short"] += 1
+            _diag_reject(diag_label, "short")
+            return None
+        try:
+            spatial_corr = float(np.corrcoef(proj_spatial, projections)[0, 1])
+        except Exception:
+            _diag_counts["reject_corr"] += 1
+            _diag_reject(diag_label, "corr_exc")
+            return None
+        if _diag and len(_diag_corr_samples) < 12:
+            _diag_corr_samples.append((seed, pix_count, spatial_corr))
+        if pix_count >= total_px * 0.03:
+            _min_spatial_corr = 0.30
+        elif _small_warm_region:
+            _min_spatial_corr = 0.28
+        else:
+            _min_spatial_corr = 0.65
+        if not np.isfinite(spatial_corr) or abs(spatial_corr) < _min_spatial_corr:
+            _used_alt_axis = False
+            if _small_warm_region:
+                _bright_mask = gray_vals >= np.percentile(gray_vals, 82)
+                _dark_mask = gray_vals <= np.percentile(gray_vals, 18)
+                if _bright_mask.sum() >= 5 and _dark_mask.sum() >= 5:
+                    _alt_vec = coords[_bright_mask].mean(axis=0) - coords[_dark_mask].mean(axis=0)
+                    _alt_norm = float(np.linalg.norm(_alt_vec))
+                    if _alt_norm > 1e-6:
+                        grad_dir = _alt_vec / _alt_norm
+                        proj_spatial = coords_c @ grad_dir
+                        p_min, p_max = float(proj_spatial.min()), float(proj_spatial.max())
+                        if p_max - p_min >= 10:
+                            try:
+                                _alt_corr = float(np.corrcoef(proj_spatial, gray_vals)[0, 1])
+                            except Exception:
+                                _alt_corr = 0.0
+                            if np.isfinite(_alt_corr) and abs(_alt_corr) >= 0.28:
+                                spatial_corr = _alt_corr
+                                _used_alt_axis = True
+            if not _used_alt_axis:
+                radial_gd = _try_small_warm_radial_gradient()
+                if radial_gd is not None:
+                    return radial_gd
+                _diag_counts["reject_corr"] += 1
+                _diag_reject(diag_label, f"corr<{_min_spatial_corr:.2f}:{spatial_corr:.2f}")
+                return None
 
-        # Compute colors at the gradient endpoints
-        low_mask = proj_spatial < np.percentile(proj_spatial, 15)
-        high_mask = proj_spatial > np.percentile(proj_spatial, 85)
+        low_mask = proj_spatial < np.percentile(proj_spatial, 8)
+        high_mask = proj_spatial > np.percentile(proj_spatial, 92)
         if low_mask.sum() < 5 or high_mask.sum() < 5:
-            continue
+            _diag_counts["reject_endpoints"] += 1
+            _diag_reject(diag_label, "endpoints")
+            return None
         color_start = colors[low_mask].mean(axis=0)
         color_end = colors[high_mask].mean(axis=0)
-
-        # Verify the endpoint colors are meaningfully different
         endpoint_dist = float(np.linalg.norm(color_end - color_start))
         if endpoint_dist < 10:
-            continue
+            _diag_counts["reject_endpoint_dist"] += 1
+            _diag_reject(diag_label, f"endpoint:{endpoint_dist:.1f}")
+            return None
 
-        # SVG coordinates for gradient line
+        texture_residual = float(np.std(src_gray[ys_s, xs_s] - src_gray_blur[ys_s, xs_s]))
+        _warm_scale = 1.55 if _small_warm_region else (1.35 if _warm_mid_sat else 1.0)
+        _texture_thresh = max(6.5, endpoint_dist * 0.42) * _warm_scale
+        if texture_residual > _texture_thresh:
+            _diag_counts["reject_texture"] += 1
+            _diag_reject(diag_label, f"texture:{texture_residual:.1f}>{_texture_thresh:.1f}")
+            return None
+
+        spatial_span = max(p_max - p_min, 1e-6)
+        t_vals = np.clip((proj_spatial - p_min) / spatial_span, 0.0, 1.0)
+        color_line = color_start[None, :] + (color_end - color_start)[None, :] * t_vals[:, None]
+        fit_residual = float(np.mean(np.linalg.norm(colors - color_line, axis=1)))
+        _fit_thresh = max(12.0, endpoint_dist * 0.30) * _warm_scale
+        if fit_residual > _fit_thresh:
+            radial_gd = _try_small_warm_radial_gradient()
+            if radial_gd is not None:
+                return radial_gd
+            _diag_counts["reject_texture"] += 1
+            _diag_reject(diag_label, f"fit:{fit_residual:.1f}>{_fit_thresh:.1f}")
+            return None
+
         x1 = float(coord_mean[0] + grad_dir[0] * p_min)
         y1 = float(coord_mean[1] + grad_dir[1] * p_min)
         x2 = float(coord_mean[0] + grad_dir[0] * p_max)
         y2 = float(coord_mean[1] + grad_dir[1] * p_max)
 
-        # Compute mid-stop color for smoother 3-stop gradient
-        mid_lo = np.percentile(proj_spatial, 40)
-        mid_hi = np.percentile(proj_spatial, 60)
+        mid_lo = np.percentile(proj_spatial, 35)
+        mid_hi = np.percentile(proj_spatial, 65)
         mid_mask = (proj_spatial >= mid_lo) & (proj_spatial <= mid_hi)
         color_mid_hex = None
         if mid_mask.sum() >= 5:
             color_mid = colors[mid_mask].mean(axis=0)
             color_mid_hex = _bgr_to_hex(np.clip(color_mid, 0, 255).astype(np.uint8))
 
+        nonlocal grad_id
         gid = f"g{grad_id}"
         grad_id += 1
-        gradient_defs.append(GradientDef(
+        return GradientDef(
             id=gid,
             x1=np.clip(x1, 0, w), y1=np.clip(y1, 0, h),
             x2=np.clip(x2, 0, w), y2=np.clip(y2, 0, h),
             color_start=_bgr_to_hex(np.clip(color_start, 0, 255).astype(np.uint8)),
             color_end=_bgr_to_hex(np.clip(color_end, 0, 255).astype(np.uint8)),
             color_mid=color_mid_hex,
-        ))
-        gradient_fill_map[k] = f"url(#{gid})"
+        )
+
+    # First pass: fit gradients across adjacent low-contrast cluster pairs.
+    centers_u8 = np.clip(centers_f, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
+    centers_hsv = cv2.cvtColor(centers_u8, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+
+    l_left = labels[:, :-1].ravel()
+    l_right = labels[:, 1:].ravel()
+    h_mask = l_left != l_right
+    c_left = src_f[:, :-1].reshape(-1, 3)[h_mask]
+    c_right = src_f[:, 1:].reshape(-1, 3)[h_mask]
+    h_diff = np.sqrt(np.sum((c_left - c_right) ** 2, axis=1))
+
+    l_top = labels[:-1, :].ravel()
+    l_bot = labels[1:, :].ravel()
+    v_mask = l_top != l_bot
+    c_top = src_f[:-1, :].reshape(-1, 3)[v_mask]
+    c_bot = src_f[1:, :].reshape(-1, 3)[v_mask]
+    v_diff = np.sqrt(np.sum((c_top - c_bot) ** 2, axis=1))
+
+    all_k1 = np.concatenate([
+        np.minimum(l_left[h_mask], l_right[h_mask]),
+        np.minimum(l_top[v_mask], l_bot[v_mask]),
+    ])
+    all_k2 = np.concatenate([
+        np.maximum(l_left[h_mask], l_right[h_mask]),
+        np.maximum(l_top[v_mask], l_bot[v_mask]),
+    ])
+    all_diffs = np.concatenate([h_diff, v_diff])
+    if len(all_k1) > 0:
+        pair_keys = all_k1.astype(np.int64) * K + all_k2
+        max_key = int(pair_keys.max()) + 1
+        diff_sums = np.bincount(pair_keys, weights=all_diffs, minlength=max_key)
+        diff_counts = np.bincount(pair_keys, minlength=max_key)
+        nonzero = diff_counts > 0
+        mean_diffs = np.zeros(max_key, dtype=np.float64)
+        mean_diffs[nonzero] = diff_sums[nonzero] / diff_counts[nonzero]
+
+        min_boundary = int(h * w * 0.0025)
+        candidate_keys = np.where((diff_counts >= min_boundary) & (mean_diffs < 18.0))[0]
+        used_clusters: set[int] = set()
+        for key in candidate_keys[np.argsort(mean_diffs[candidate_keys])]:
+            _diag_counts["pair_candidates"] += 1
+            k1, k2 = divmod(int(key), K)
+            if k1 == bg_cluster or k2 == bg_cluster:
+                continue
+            if k1 in used_clusters or k2 in used_clusters:
+                continue
+            sat1, sat2 = int(centers_hsv[k1, 1]), int(centers_hsv[k2, 1])
+            hue1, hue2 = int(centers_hsv[k1, 0]), int(centers_hsv[k2, 0])
+            if sat1 > 20 and sat2 > 20:
+                hue_diff = abs(hue1 - hue2)
+                hue_diff = min(hue_diff, 180 - hue_diff)
+                if hue_diff > 15:
+                    _diag_counts["reject_pair_hue"] += 1
+                    continue
+            pair_mask = (labels == k1) | (labels == k2)
+            fit_mask = pair_mask
+            _cc_count, _cc_labels = cv2.connectedComponents(pair_mask.astype(np.uint8))
+            if _cc_count > 2:
+                _cc_sizes = np.bincount(_cc_labels.ravel())[1:]
+                if len(_cc_sizes) == 0 or int(_cc_sizes.max()) < int(np.count_nonzero(pair_mask) * 0.85):
+                    _diag_counts["reject_pair_cc"] += 1
+                    continue
+                _largest_idx = int(np.argmax(_cc_sizes)) + 1
+                fit_mask = _cc_labels == _largest_idx
+            gd = _fit_gradient_region(fit_mask, seed=k1 * K + k2, diag_label=f"pair:{k1},{k2}")
+            if gd is None:
+                continue
+            gradient_defs.append(gd)
+            ys_fit, xs_fit = np.where(fit_mask)
+            if len(xs_fit) == 0:
+                gradient_defs.pop()
+                _diag_counts["reject_pair_cc"] += 1
+                continue
+            _fill_ref = f"url(#{gd.id})"
+            _bbox = (
+                float(xs_fit.min()),
+                float(ys_fit.min()),
+                float(xs_fit.max()),
+                float(ys_fit.max()),
+            )
+            single_gradient_regions.setdefault(k1, []).append(
+                GradientRegionAssignment(fill_ref=_fill_ref, bbox=_bbox, mask=fit_mask.copy())
+            )
+            single_gradient_regions.setdefault(k2, []).append(
+                GradientRegionAssignment(fill_ref=_fill_ref, bbox=_bbox, mask=fit_mask.copy())
+            )
+            gradient_fill_map[k1] = _fill_ref
+            gradient_fill_map[k2] = _fill_ref
+            _diag_counts["pair_accept"] += 1
+            _diag_accept_regions.append(
+                f"pair:{k1},{k2}:{gd.kind}:bbox=({_bbox[0]:.0f},{_bbox[1]:.0f})-({_bbox[2]:.0f},{_bbox[3]:.0f})"
+            )
+            used_clusters.add(k1)
+            used_clusters.add(k2)
+
+    for k in range(K):
+        if k == bg_cluster:
+            continue
+        if k in gradient_fill_map:
+            continue
+        _diag_counts["single_candidates"] += 1
+        cluster_mask = labels == k
+        fit_masks: list[np.ndarray] = [cluster_mask]
+        _cc_count, _cc_labels = cv2.connectedComponents(cluster_mask.astype(np.uint8))
+        _hue_k = int(centers_hsv[k, 0])
+        _sat_k = int(centers_hsv[k, 1])
+        _warm_mid_cluster = 5 <= _hue_k <= 25 and 25 <= _sat_k <= 140
+        if _cc_count > 2:
+            _cc_sizes = np.bincount(_cc_labels.ravel())[1:]
+            if len(_cc_sizes) == 0:
+                _diag_counts["reject_single_cc"] += 1
+                continue
+            _cluster_px = int(np.count_nonzero(cluster_mask))
+            _largest_idx = int(np.argmax(_cc_sizes)) + 1
+            _largest_size = int(_cc_sizes[_largest_idx - 1])
+            if _largest_size < int(_cluster_px * 0.12):
+                _diag_counts["reject_single_cc"] += 1
+                continue
+            fit_masks = [_cc_labels == _largest_idx]
+            if _warm_mid_cluster:
+                _candidate_components: list[tuple[float, int]] = []
+                for _rank_idx in np.argsort(_cc_sizes)[::-1][1:4]:
+                    _component_size = int(_cc_sizes[_rank_idx])
+                    if _component_size < int(_cluster_px * 0.03):
+                        continue
+                    _component_mask = _cc_labels == (_rank_idx + 1)
+                    _component_vals = src_gray_blur[_component_mask]
+                    if _component_vals.size == 0:
+                        continue
+                    _ys_c, _xs_c = np.where(_component_mask)
+                    _luma_span = float(np.percentile(_component_vals, 95) - np.percentile(_component_vals, 5))
+                    _candidate_score = _luma_span + 30.0 * (_component_size / max(_cluster_px, 1))
+                    _candidate_components.append((_candidate_score, _rank_idx + 1))
+                    if _diag and len(_diag_component_candidates) < 12:
+                        _diag_component_candidates.append(
+                            f"k={k}:cc={_rank_idx + 1}:score={_candidate_score:.1f}:px={_component_size}:bbox=({int(_xs_c.min())},{int(_ys_c.min())})-({int(_xs_c.max())},{int(_ys_c.max())})"
+                        )
+                for _, _component_label in sorted(_candidate_components, reverse=True)[:2]:
+                    fit_masks.append(_cc_labels == _component_label)
+        _accepted_for_cluster = 0
+        for _component_idx, fit_mask in enumerate(fit_masks):
+            _min_region_override = 0.6 if (_warm_mid_cluster and _component_idx > 0) else None
+            gd = _fit_gradient_region(
+                fit_mask,
+                seed=k * 10 + _component_idx,
+                min_region_pct_override=_min_region_override,
+                diag_label=f"single:{k}:comp={_component_idx}",
+            )
+            if gd is None:
+                continue
+            gradient_defs.append(gd)
+            ys_fit, xs_fit = np.where(fit_mask)
+            if len(xs_fit) == 0:
+                _diag_counts["reject_single_cc"] += 1
+                gradient_defs.pop()
+                continue
+            single_gradient_regions.setdefault(k, []).append(GradientRegionAssignment(
+                fill_ref=f"url(#{gd.id})",
+                bbox=(
+                    float(xs_fit.min()),
+                    float(ys_fit.min()),
+                    float(xs_fit.max()),
+                    float(ys_fit.max()),
+                ),
+                mask=fit_mask.copy(),
+            ))
+            _diag_counts["single_accept"] += 1
+            _diag_accept_regions.append(
+                f"single:{k}:comp={_component_idx}:{gd.kind}:bbox=({float(xs_fit.min()):.0f},{float(ys_fit.min()):.0f})-({float(xs_fit.max()):.0f},{float(ys_fit.max()):.0f}) hsv=({_hue_k},{_sat_k},{int(centers_hsv[k, 2])})"
+            )
+            _accepted_for_cluster += 1
+            if _accepted_for_cluster >= 2:
+                break
+
+    if _diag:
+        print(f"[GRAD] candidates pair={_diag_counts['pair_candidates']} single={_diag_counts['single_candidates']} accept pair={_diag_counts['pair_accept']} single={_diag_counts['single_accept']}")
+        print(
+            "[GRAD] rejects "
+            f"small={_diag_counts['reject_small']} spread={_diag_counts['reject_spread']} "
+            f"corr={_diag_counts['reject_corr']} short={_diag_counts['reject_short']} "
+            f"endpoints={_diag_counts['reject_endpoints']} endpoint_dist={_diag_counts['reject_endpoint_dist']} "
+            f"texture={_diag_counts['reject_texture']} "
+            f"pair_hue={_diag_counts['reject_pair_hue']} pair_cc={_diag_counts['reject_pair_cc']} "
+            f"single_cc={_diag_counts['reject_single_cc']} cov={_diag_counts['reject_cov']}"
+        )
+        if _diag_corr_samples:
+            _diag_corr_samples.sort(key=lambda item: abs(item[2]), reverse=True)
+            print("[GRAD] corr samples " + ", ".join(
+                f"seed={seed}:px={pix}:corr={corr:.3f}"
+                for seed, pix, corr in _diag_corr_samples[:8]
+            ))
+        if _diag_accept_regions:
+            print("[GRAD] accepted " + " | ".join(_diag_accept_regions))
+        if _diag_component_candidates:
+            print("[GRAD] warm components " + " | ".join(_diag_component_candidates))
+        if _diag_reject_regions:
+            print("[GRAD] rejected regions " + " | ".join(_diag_reject_regions))
+        if _diag_radial_regions:
+            print("[GRAD] radial regions " + " | ".join(_diag_radial_regions))
 
 
 def _gradient_aware_merge(
@@ -1506,23 +2677,26 @@ def _merge_close_clusters(
         if len(alive_ids) <= 3:
             break
 
-        # Find the closest pair among alive clusters
+        # Find the closest mergeable pair (adaptive threshold for dark clusters).
+        # Weber's law: JND is larger at low luminance, so very dark clusters
+        # that look perceptually identical can have larger ΔE in LAB.
         best_dist = float("inf")
         best_i, best_j = -1, -1
         for idx_a in range(len(alive_ids)):
             for idx_b in range(idx_a + 1, len(alive_ids)):
                 i, j = alive_ids[idx_a], alive_ids[idx_b]
                 if centers_lab is not None:
-                    d = np.linalg.norm(centers_lab[i] - centers_lab[j])
+                    d = float(np.linalg.norm(centers_lab[i] - centers_lab[j]))
+                    avg_L = (centers_lab[i][0] + centers_lab[j][0]) / 2.0
+                    pair_thresh = lab_threshold * max(1.0, 2.0 - avg_L / 25.0)
                 else:
-                    d = np.linalg.norm(centers_f[i] - centers_f[j])
-                if d < best_dist:
+                    d = float(np.linalg.norm(centers_f[i] - centers_f[j]))
+                    pair_thresh = threshold
+                if d < pair_thresh and d < best_dist:
                     best_dist = d
                     best_i, best_j = i, j
 
-        # LAB threshold: configurable ΔE — higher for grayscale to merge close shades
-        merge_thresh = lab_threshold if centers_lab is not None else threshold
-        if best_dist > merge_thresh:
+        if best_i < 0:
             break
 
         # Merge smaller into larger
@@ -1747,6 +2921,54 @@ def _detect_shape(contour: np.ndarray, min_area: float = 50.0) -> str | None:
     return None
 
 
+def _subdivide_4point_closed(pts: np.ndarray, corner_threshold_deg: float = 55.0) -> np.ndarray:
+    """Corner-preserving 4-point interpolatory subdivision for closed polygons.
+
+    Inserts new midpoints between non-corner vertices using the 4-point
+    scheme (Dyn, Levin, Gregory 1987).  Original vertices are preserved
+    (interpolatory).  Corners and their immediate neighbours are skipped.
+
+    Provides the Bézier fitter with denser, geometrically optimal input
+    in smooth sections, improving curve quality without moving existing
+    vertices.
+    """
+    n = len(pts)
+    if n < 5:
+        return pts
+
+    # Vectorised corner detection for closed polygon
+    incoming = pts - np.roll(pts, 1, axis=0)
+    outgoing = np.roll(pts, -1, axis=0) - pts
+    dot_ = np.sum(incoming * outgoing, axis=1)
+    len_in = np.linalg.norm(incoming, axis=1)
+    len_out = np.linalg.norm(outgoing, axis=1)
+    valid = (len_in > 1e-10) & (len_out > 1e-10)
+    cos_a = np.ones(n)
+    cos_a[valid] = np.clip(dot_[valid] / (len_in[valid] * len_out[valid]), -1.0, 1.0)
+    angles = np.arccos(cos_a)
+    corners = set(np.where(valid & (angles > np.radians(corner_threshold_deg)))[0])
+
+    # Build new polygon with inserted midpoints
+    new_pts = []
+    for i in range(n):
+        new_pts.append(pts[i])
+
+        j = (i + 1) % n
+        # Skip near corners — preserve sharp features
+        if i in corners or j in corners:
+            continue
+        im1 = (i - 1) % n
+        jp1 = (j + 1) % n
+        if im1 in corners or jp1 in corners:
+            continue
+
+        # 4-point interpolatory rule: ω = 1/16
+        mid = (-pts[im1] + 9.0 * pts[i] + 9.0 * pts[j] - pts[jp1]) / 16.0
+        new_pts.append(mid)
+
+    return np.array(new_pts)
+
+
 def _fit_contour(
     contour: np.ndarray,
     simplify_epsilon: float,
@@ -1754,7 +2976,7 @@ def _fit_contour(
     corner_threshold: float,
     line_tolerance: float = 0.15,
 ) -> str:
-    """Simplify contour and fit smooth closed Bezier curves; return SVG path d.
+    """Simplify contour and fit smooth closed Bézier curves; return SVG path d.
 
     Uses an artistic pipeline: RDP simplification, Bezier fitting,
     line-to-curve promotion, G1 continuity enforcement, segment
@@ -1770,30 +2992,22 @@ def _fit_contour(
     if len(simplified) < 3:
         return ""
 
+    # Corner-preserving 4-point subdivision: insert geometrically optimal
+    # midpoints in smooth sections for better Bézier fitting
+    if len(simplified) >= 5:
+        simplified = _subdivide_4point_closed(simplified, corner_threshold)
+
     try:
         curve = fit_closed_bezier(
             simplified, max_error=max_error,
             corner_threshold=corner_threshold,
             line_tolerance=line_tolerance,
         )
-        # Step 1: Promote line segments to curves where possible
-        curve = reduce_nodes(curve, max_error=max_error * 2.5)
-        # Step 2: Merge short segments into longer artistic curves
-        curve = _merge_short_curves(curve, max_error=max_error)
-        # Step 3: DP-optimal segment merging (Potrace-style)
-        curve = merge_segments_artistic(curve, tolerance=max_error * 2.0)
-        # Step 4: Enforce G1 tangent continuity at all joins
-        curve = enforce_g1_continuity(curve)
-        # Step 5: Second merge pass — skip for complex contours (>200 segs)
-        # where the O(n²) DP becomes a bottleneck
-        if len(curve.segments) <= 200:
-            curve = merge_segments_artistic(curve, tolerance=max_error * 2.0)
-            # Step 6: Final G1 enforcement after second merge
-            curve = enforce_g1_continuity(curve)
-        # Step 7: Safety valve — aggressively merge dense contours
-        if len(curve.segments) > 80:
-            curve = merge_segments_artistic(curve, tolerance=max_error * 3.0)
-            curve = enforce_g1_continuity(curve)
+        # Promote line-segment runs to curves where beneficial
+        curve = reduce_nodes(curve, max_error=max_error * 2.0)
+        # Artistic merge for dense contours
+        if len(curve.segments) > 100:
+            curve = merge_segments_artistic(curve, tolerance=max_error * 1.5)
     except Exception:
         return ""
 
@@ -1822,23 +3036,25 @@ def _curve_to_d(curve) -> str:
     return "".join(parts)
 
 
-def _process_stroke_cluster(
-    labels: np.ndarray,
-    cluster_idx: int,
-    w: int,
-    h: int,
+def _process_stroke_mask(
+    mask_k: np.ndarray,
     scale: int,
     simplify_epsilon: float,
     max_error: float,
     corner_threshold: float,
     line_tolerance: float,
+    min_branch_length: int | None = None,
 ) -> tuple[list[str], list[float]] | None:
-    """Skeleton-based stroke reconstruction for thin line-art clusters.
+    """Skeleton-based stroke reconstruction from a binary mask.
 
     Returns (paths, widths) or None if no valid strokes found.
     """
     S = scale
-    mask_k = (labels == cluster_idx).astype(np.uint8)
+    if mask_k.dtype != np.uint8:
+        mask_k = mask_k.astype(np.uint8)
+    if mask_k.ndim != 2 or np.count_nonzero(mask_k) == 0:
+        return None
+    h, w = mask_k.shape[:2]
 
     # Upscale for sub-pixel skeleton quality
     mask_up = cv2.resize(mask_k * 255, (w * S, h * S),
@@ -1857,7 +3073,8 @@ def _process_stroke_cluster(
     skel = _skeletonize(mask_bin > 0).astype(np.uint8)
 
     # Prune short branches
-    skel = _prune_skeleton(skel, min_branch_length=max(3, S))
+    _prune_len = max(3, S) if min_branch_length is None else max(1, int(min_branch_length))
+    skel = _prune_skeleton(skel, min_branch_length=_prune_len)
 
     # Trace ordered paths through skeleton
     paths = _trace_skeleton_paths(skel)
@@ -1912,6 +3129,32 @@ def _process_stroke_cluster(
     if not s_paths:
         return None
     return s_paths, s_widths
+
+
+def _process_stroke_cluster(
+    labels: np.ndarray,
+    cluster_idx: int,
+    w: int,
+    h: int,
+    scale: int,
+    simplify_epsilon: float,
+    max_error: float,
+    corner_threshold: float,
+    line_tolerance: float,
+) -> tuple[list[str], list[float]] | None:
+    """Skeleton-based stroke reconstruction for thin line-art clusters.
+
+    Returns (paths, widths) or None if no valid strokes found.
+    """
+    mask_k = (labels == cluster_idx).astype(np.uint8)
+    return _process_stroke_mask(
+        mask_k,
+        scale=scale,
+        simplify_epsilon=simplify_epsilon,
+        max_error=max_error,
+        corner_threshold=corner_threshold,
+        line_tolerance=line_tolerance,
+    )
 
 
 def _bgr_to_hex(color) -> str:
@@ -2016,7 +3259,18 @@ def optimize_svg_colors(
     """
     import cairosvg
     h, w = source_bgr.shape[:2]
+
+    # This post-pass is helpful on low-saturation artwork, but it washes out
+    # high-saturation photos by dragging clustered fills toward broad median
+    # samples. Skip it for strongly chromatic images and keep the vectorizer's
+    # own render-center colors instead.
+    hsv = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2HSV)
+    sat_frac = float(np.count_nonzero(hsv[:, :, 1] > 35)) / max(1, h * w)
+    if sat_frac > 0.25:
+        return svg_string
+
     svg = svg_string
+
     _fringe_colors: set[str] = set()
     for m in re.finditer(r'fill="(#[0-9a-fA-F]{6})"[^/]*opacity="', svg):
         _fringe_colors.add(m.group(1))
@@ -2058,6 +3312,7 @@ def optimize_svg_colors(
                 mean_orig = np.median(src_samples[close_mask], axis=0)
             else:
                 mean_orig = np.median(src_samples, axis=0)
+
             nb, ng, nr = (int(round(np.clip(v, 0, 255))) for v in mean_orig)
             new_hex = f"#{nr:02x}{ng:02x}{nb:02x}"
             if new_hex != hex_color:

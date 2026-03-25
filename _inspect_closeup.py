@@ -7,7 +7,7 @@ import os
 Image.MAX_IMAGE_PIXELS = None  # allow large images
 os.makedirs("_comparisons", exist_ok=True)
 
-for name in ["Ref", "test3", "test2", "test5"]:
+for name in ["Ref", "test3", "test2", "test4", "test5"]:
     svg_path = f"_comparisons/{name}_output.svg"
     orig_candidates = [
         f"{name}.png",
