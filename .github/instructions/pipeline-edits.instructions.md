@@ -43,10 +43,10 @@ export DYLD_LIBRARY_PATH="/opt/homebrew/opt/cairo/lib"
 
 ## Before Making Changes
 
-Read relevant knowledgebase files via memory tool:
+Read relevant knowledgebase files via readFile:
 
-- `/memories/repo/kb-baselines.md` — current metrics (your BEFORE numbers)
-- `/memories/repo/kb-what-failed.md` — don't retry proven failures
-- `/memories/repo/kb-params.md` — parameter rationale
+- `.github/knowledge/kb-baselines.md` — current metrics (your BEFORE numbers)
+- `.github/knowledge/kb-what-failed.md` — don't retry proven failures
+- `.github/knowledge/kb-params.md` — parameter rationale
 
 For deeper pipeline architecture details, load the `svg-pipeline-knowledge` skill.

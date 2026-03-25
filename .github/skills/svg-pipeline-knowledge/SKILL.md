@@ -5,6 +5,8 @@ description: "Deep knowledge of the SVG vectorization pipeline: architecture, pa
 
 # SVG Pipeline Knowledge
 
+> **This project converts raster images → SVG. It never parses or reads existing SVG files.** All "SVG improvement" requests mean improving the vectorization output quality.
+
 Use this skill when editing pipeline code or diagnosing vectorization quality issues.
 
 ## Key Files

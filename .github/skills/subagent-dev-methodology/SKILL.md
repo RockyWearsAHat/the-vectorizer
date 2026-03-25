@@ -20,7 +20,7 @@ Each improvement cycle is one implementer pass, optionally followed by one valid
 
 ### Implementer Pass
 
-1. Read relevant KB files via memory tool (baselines, what-failed, etc.)
+1. Read relevant KB files (`.github/knowledge/kb-baselines.md`, `kb-what-failed.md`, etc.)
 2. Read only the relevant code and prior findings
 3. Apply the batched change set for one clear hypothesis
 4. Run `compare_all.py` — capture numeric metrics as a **quick regression screen**

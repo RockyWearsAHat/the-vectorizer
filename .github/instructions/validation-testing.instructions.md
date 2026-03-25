@@ -44,4 +44,4 @@ Generated in `_comparisons/`:
 
 ## Before Running Validation
 
-Read baselines via memory tool: `/memories/repo/kb-baselines.md`
+Read baselines via readFile: `.github/knowledge/kb-baselines.md`

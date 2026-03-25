@@ -1,8 +1,18 @@
 # Copilot Instructions — SVG-gen
 
+## What This Project Is
+
+This is a **raster-to-SVG vectorization engine**. It takes raster images (PNG, JPEG) as input and produces SVG vector output. It is a one-way pipeline: **raster in → SVG out**.
+
+**It does NOT parse, read, import, or analyze existing SVG files.** There is no SVG input path. If someone mentions "SVG" in any improvement request, they mean the **generated SVG output quality** — not SVG file parsing or reading.
+
+## How to Interpret Requests
+
+Any request containing words like "improve", "fix", "better", "enhance", "optimize" combined with "SVG", "output", "quality", "vectorization", "parsing", "generation", or "pipeline" means: **improve the visual quality of the raster-to-vector conversion**. This applies even when the wording is vague. Do NOT search for XML parsing code, SVG readers, or file parsers — they don't exist in this project. Instead, follow the "Default Behavior for Quality Improvement Requests" section below.
+
 ## Project Goal
 
-Raster-to-SVG vectorization engine producing output indistinguishable from hand-traced Adobe Illustrator artwork. Smooth G1-continuous Bézier curves, minimal SVG node count, zero artifacts, efficient CPU execution.
+Output indistinguishable from hand-traced Adobe Illustrator artwork. Smooth G1-continuous Bézier curves, minimal SVG node count, zero artifacts, efficient CPU execution.
 
 The visual standard: an artist hand-tracing the image would produce the same result — clean curves, faithful colors, proper anti-aliased edges interpreted as vector shapes.
 
@@ -88,7 +98,7 @@ python check_regression.py      # auto-diffs vs baselines, flags regressions
 
 ## Default Behavior for Quality Improvement Requests
 
-When the user asks to improve quality, fix metrics, run an experiment, or work on a specific image — follow this workflow automatically WITHOUT needing to be told to use @main-orchestrator:
+When the user asks to improve anything related to SVG output, vectorization, quality, metrics, parsing, generation, or any specific image — follow this workflow automatically WITHOUT needing to be told to use @main-orchestrator. This includes vague requests like "improve the SVG", "make it better", "fix the output", etc.:
 
 1. **Read the KB** (readFile): `.github/knowledge/kb-baselines.md`, `kb-research-queue.md`, `kb-what-failed.md`, `kb-per-image.md`
 2. **Identify the biggest bottleneck**: Lowest Feat%, highest WdErr, worst MnDif
@@ -105,27 +115,35 @@ This is the default workflow for any improvement task. No need to invoke `@main-
 This project requires **genuine creative judgment**, not blind parameter tuning. Enforce this ratchet:
 
 ### Level 1 — Parameter tuning (first resort)
+
 Try parameter changes only when you have a **specific causal hypothesis**: _"X parameter controls Y behavior, which is causing Z metric to be wrong because…"_
 
 ### Level 2 — Algorithm change (after 3 failed tunings in the same category)
+
 If you've tried 3 parameter changes targeting the same metric and all regressed or were neutral, **stop tuning**. You've found a tuning dead end. The problem requires a structural fix.
+
 - Read `kb-research-queue.md` for the next READY algorithmic hypothesis
 - Read `svg-vectorization-research.md` for evidence about what actually works
 
 ### Level 3 — Structural rethink (when algorithm is blocked)
+
 If both parameter tuning and algorithmic changes are blocked, step back and ask:
+
 - **What is the actual failure mode?** (fragmentation? over-expansion? node inflation?)
 - **What does the research say causes this failure?** (read `svg-vectorization-research.md`)
 - **What structural change would address the ROOT CAUSE?** (not the symptom)
 
 ### Anti-patterns (never do these)
+
 - Trying iso=0.43 after iso=0.44 failed without a new hypothesis — this is not creative, it's random walk
 - Making 5 consecutive parameter tweaks to the same value
 - Calling a regression "acceptable" to avoid reverting
 - Adding complexity (new special cases, guards, gates) without evidence they'll help
 
 ### Creative license (encouraged)
+
 When standard approaches are blocked, the right move is **creative structural thinking**:
+
 - Study what the best vectorizers do (see `svg-vectorization-research.md`)
 - Question pipeline assumptions (does painter's algorithm require soft-field overlap? yes — see kb-what-failed)
 - Consider approaching the problem from a completely different angle
