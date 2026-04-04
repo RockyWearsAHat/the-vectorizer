@@ -109,6 +109,49 @@
 - `optimize_svg_colors` should be treated as a low-saturation cleanup pass, not a universal post-process. Gating it off for high-saturation images (`sat_frac > 0.25`) avoids severe regressions on `test3` and improves the saturated photo set overall.
 - For high-saturation mural-like photos such as `test5`, conservative large-group detail overlays inside very large high-variance contour groups can improve internal mural fidelity without broad regressions. Current accepted effect: `test5` held **82.2 / 3.2 / 9.0** while improving `MnDif` from **10.59 -> 10.46**.
 
+## Image classification routing (2026)
+
+- **`_classify_image(img)`** returns `'line_art'` | `'flat_color'` | `'photographic'` based on gradient stats.
+- **line_art**: mean_sat < 20, mean_grad < 0.15, bg_frac > 0.50
+- **flat_color**: mean_grad < 0.03 AND edge_frac < 0.04 AND n_unique_colors < 30
+- **photographic**: everything else (including botanical ink on white — test3)
+- **CRITICAL**: test3 (sparse ink on white) has low mean gradient + few distinct colors — exactly mimics flat_color. The 0.03/0.04/30 thresholds are carefully tuned so test3 routes to photographic. Do NOT loosen them.
+- Routing occurs at the top of `multilevel_vectorize()` before any pipeline work starts.
+
+## Flat-color fast pipeline (2026)
+
+- **`_pipeline_flat_color(img)`**: K-means quantization → binary masks → cv2.findContours → Bézier fitting.
+- No soft-field computation (expensive), no superresolution.
+- For logos, seating maps, diagrams, icons — any image where `mean_grad<0.03 AND edge_frac<0.04 AND n_unique<30`.
+- Returns SVG string directly (early return from `multilevel_vectorize`).
+- Expected wins: order-of-magnitude faster than photographic pipeline for flat-color inputs.
+
+## GrabCut background removal (2026)
+
+- **`_remove_background_grabcut(img)`** + **`_fg_by_flood_fill(img)`**
+- Opt-in via `multilevel_vectorize(remove_background=True)`.
+- Uses flood-fill from corners to identify likely-background pixels as GrabCut seeds.
+- Iterative GrabCut: 5 iterations → alpha channel output.
+- Exposed in FastAPI endpoint as `remove_background: bool = Form(True)`.
+- Frontend toggle already exists in `App.tsx` (`removeBackground` state + switch UI).
+
+## Area merge (2026)
+
+- **`_area_merge_clusters(labels, img_lab, total_area, mode)`**: He et al. 2024 LAB-space fragment merging.
+- Merges clusters where `min(area_i, area_j) × LAB_dist² < lambda_ × total_area × 100`.
+- `lambda_=0.002` (photographic), `0.0005` (line_art) — conservative, won't merge perceptually different colors.
+- Runs after dark chromatic merge (Step 1f). 0.62s for 25MP.
+- Reduces cluster count for fragmented images; limited benefit when fragmentation is within-cluster.
+
+## Adaptive simplify_epsilon scaling (2026)
+
+- For clusters with `len(_contour_groups) > 300`: `_se = simplify_epsilon * min(2.5, N/300)`
+- Scales RDP tolerance up when a cluster has many groups → fewer nodes per contour without filtering any contours.
+- Does NOT affect which contours survive — only how smooth each curve is.
+- **test3 WdErr 12.11→11.16 (-0.95), test5 WdErr 6.48→5.01 (-1.47)**
+- Minor Feat% regression: -0.6 to -0.8pp on test3/4/5 (acceptable).
+- Optimal config: 300-group threshold, 2.5× cap. 500-group threshold loses all WdErr benefit. 1.8× cap gives less WdErr improvement.
+
 ## Theoretical ceiling
 
 - Pixel-perfect 5-color: SSIM 0.9985

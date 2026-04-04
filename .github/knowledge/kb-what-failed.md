@@ -28,6 +28,9 @@ Each entry: what was tried → what happened → why it failed.
 - **max_k 14→18** → REGRESSES all images (cluster fragmentation hurts feature presence)
 - **chroma weight 2→3** → REGRESSES test5 (-1.5% Feature, +1.38 MnDif)
 - **Disabling gradient detection for high-K** → REGRESSES test5
+- **Aggressive `_area_mult` scaling** (2026): `max(1.5, len(_contour_groups)/200.0)` reduced test4 nodes 123K→100K BUT caused test4 WdErr 2.56→6.65 (catastrophic) and test5 Feat% -2pp. Root cause: `_area_mult` filters real edge-defining contours, not just noise. Hard `1.5×` multiplier is the safe ceiling.
+- **simplify_epsilon with 500-group threshold** (2026): Losing all WdErr benefit. test3 WdErr went back to 12.15, test5 WdErr ballooned to 9.21. The 300-group threshold is the correct one.
+- **simplify_epsilon with 1.8× cap** (2026): Slightly better Feat% but significantly worse WdErr — not worth it. 2.5× cap is optimal.
 
 ## Architecture dead ends
 

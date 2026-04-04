@@ -76,6 +76,7 @@ async def vectorize_endpoint(
     result = multilevel_vectorize(
         region,
         num_levels=max(2, min(num_levels, 64)),
+        remove_background=remove_background,
     )
 
     svg = generate_svg(result, remove_background=remove_background)

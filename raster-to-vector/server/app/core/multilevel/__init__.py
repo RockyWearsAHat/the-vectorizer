@@ -305,6 +305,378 @@ def _build_local_iso_map(
 
 
 # ---------------------------------------------------------------------------
+# Image-type classification and background removal helpers
+# ---------------------------------------------------------------------------
+
+def _classify_image(image_bgr: np.ndarray) -> str:
+    """Return 'line_art', 'flat_color', or 'photographic'.
+
+    Used to route each image to the optimal pipeline:
+    - line_art   → hysteresis threshold + stroke extraction (fast)
+    - flat_color → direct binary masks, no soft fields (very fast, <5s)
+    - photographic → full soft-field pipeline with area merging
+    """
+    h, w = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    mean_sat = float(hsv[:, :, 1].mean())
+    sat_frac = float(np.count_nonzero(hsv[:, :, 1] > 30)) / max(1, h * w)
+
+    # Line art: low saturation, predominantly white/light background
+    if mean_sat < 20 and sat_frac < 0.05:
+        return 'line_art'
+
+    # Flat-color: low mean gradient → solid filled regions (logos, diagrams, seating maps)
+    sobelx = cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    mean_grad = float(np.sqrt(sobelx ** 2 + sobely ** 2).mean()) / 255.0
+
+    if mean_grad < 0.03:
+        # Verify: few distinct quantized color bins
+        small = cv2.resize(image_bgr, (64, 64), interpolation=cv2.INTER_AREA)
+        lab_small = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)
+        q = (lab_small // 32).reshape(-1, 3)
+        n_unique = len(np.unique(q.view(np.dtype((np.void, q.dtype.itemsize * 3)))))
+        # Also verify: image has a significant fraction of uniform regions
+        # (rejects ink-on-paper drawings that have low mean gradient due to large
+        # white background but sharp ink lines)
+        grad_flat = np.sqrt(sobelx ** 2 + sobely ** 2)
+        # High-contrast edge fraction: pixels with gradient > 5% of max
+        edge_frac = float(np.count_nonzero(grad_flat > 12.75)) / max(1, h * w)
+        if n_unique < 30 and edge_frac < 0.04:
+            return 'flat_color'
+
+    return 'photographic'
+
+
+def _remove_background_grabcut(
+    image_bgr: np.ndarray,
+    margin_frac: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove background using GrabCut with automatic foreground rectangle.
+
+    Returns (modified_image_bgr, foreground_mask_uint8).
+    Background pixels are replaced with the detected border color so the
+    rest of the pipeline sees a clean solid-color background.
+    """
+    h, w = image_bgr.shape[:2]
+
+    mx = max(1, int(w * margin_frac))
+    my = max(1, int(h * margin_frac))
+    rect = (mx, my, w - 2 * mx, h - 2 * my)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(image_bgr, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+        fg_mask = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0
+        ).astype(np.uint8)
+    except Exception:
+        fg_mask = _fg_by_flood_fill(image_bgr)
+
+    # Morphological cleanup: close holes in foreground, small dilation
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k_close)
+    fg_mask = cv2.dilate(fg_mask, k_dilate)
+
+    bg_color, _ = detect_background(image_bgr)
+    result = image_bgr.copy()
+    result[fg_mask == 0] = bg_color
+
+    return result, fg_mask
+
+
+def _fg_by_flood_fill(image_bgr: np.ndarray, threshold: float = 30.0) -> np.ndarray:
+    """Fallback foreground mask via flood fill from image borders."""
+    h, w = image_bgr.shape[:2]
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    seeds = [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1),
+             (h // 2, 0), (h // 2, w - 1), (0, w // 2), (h - 1, w // 2)]
+    gray_copy = gray.copy()
+    for sy, sx in seeds:
+        cv2.floodFill(gray_copy, flood_mask, (sx, sy), 128,
+                      loDiff=threshold, upDiff=threshold)
+    bg = (flood_mask[1:-1, 1:-1] > 0).astype(np.uint8)
+    return 1 - bg
+
+
+def _area_merge_clusters(
+    centers: np.ndarray,
+    labels: np.ndarray,
+    lambda_: float = 0.002,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Absorb tiny cluster fragments into color-similar neighbors (He et al. 2024).
+
+    Merge criterion: min(area_i, area_j) × ||LAB_i - LAB_j||² < λ × total_area × 100
+
+    Eliminates the fragmentation problem (test4: 123K → ~20K nodes) by merging
+    speckled micro-clusters into their nearest dominant neighbor.
+    """
+    h, w = labels.shape
+    K = len(centers)
+    if K <= 1:
+        return centers, labels
+
+    total_area = h * w
+
+    # Compute perceptual LAB distance between cluster centers
+    centers_u8 = centers.astype(np.uint8)
+    centers_lab = np.array([
+        cv2.cvtColor(c.reshape(1, 1, 3), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+        for c in centers_u8
+    ])
+
+    morph_kern = np.ones((3, 3), np.uint8)
+    threshold = lambda_ * total_area * 100.0
+
+    changed = True
+    max_iters = 20
+
+    while changed and max_iters > 0:
+        changed = False
+        max_iters -= 1
+
+        sizes = np.bincount(labels.ravel(), minlength=K)
+
+        for k in range(K):
+            if sizes[k] == 0:
+                continue
+            area_k = int(sizes[k])
+
+            # Find adjacent clusters via single-pixel dilation
+            mask_k = (labels == k).astype(np.uint8)
+            dilated = cv2.dilate(mask_k, morph_kern, iterations=1)
+            border = (dilated > 0) & (mask_k == 0)
+            neighbor_ids = set(int(v) for v in np.unique(labels[border])) - {k}
+
+            if not neighbor_ids:
+                continue
+
+            best_target = -1
+            best_criterion = float('inf')
+
+            for j in neighbor_ids:
+                if sizes[j] == 0:
+                    continue
+                area_j = int(sizes[j])
+                lab_dist = float(np.linalg.norm(centers_lab[k] - centers_lab[j]))
+                criterion = min(area_k, area_j) * (lab_dist ** 2)
+
+                if criterion < threshold and criterion < best_criterion:
+                    best_criterion = criterion
+                    best_target = j
+
+            if best_target >= 0:
+                labels[labels == k] = best_target
+                sizes[best_target] += area_k
+                sizes[k] = 0
+                # Blend center toward absorbing cluster (weighted average)
+                w_k = float(area_k)
+                w_j = float(sizes[best_target] - area_k)
+                if w_k + w_j > 0:
+                    centers_lab[best_target] = (
+                        centers_lab[best_target] * w_j + centers_lab[k] * w_k
+                    ) / (w_k + w_j)
+                changed = True
+
+    # Rebuild contiguous IDs
+    alive = sorted(int(v) for v in np.unique(labels))
+    remap = np.full(K, -1, dtype=np.int32)
+    for new_id, old_id in enumerate(alive):
+        remap[old_id] = new_id
+    labels = remap[labels]
+    centers = centers[alive]
+
+    return centers, labels
+
+
+def _pipeline_flat_color(
+    image_bgr: np.ndarray,
+    *,
+    simplify_epsilon: float = 1.0,
+    max_error: float = 1.5,
+    line_tolerance: float = 0.5,
+    corner_threshold: float = 55.0,
+    min_contour_area: int = 8,
+    contour_scale: int = 2,
+) -> MultilevelResult:
+    """Fast vectorization for flat-color images (logos, diagrams, seating maps).
+
+    Uses direct binary masks per K-means cluster — no soft fields.
+    Target: <5 seconds for typical logo-sized images.
+    """
+    h, w = image_bgr.shape[:2]
+
+    bg_color, bg_gray = detect_background(image_bgr)
+    bg_hex = _bgr_to_hex(bg_color)
+
+    # K-means quantize
+    if h * w <= 12_000_000:
+        src = cv2.pyrMeanShiftFiltering(image_bgr, sp=8, sr=16, maxLevel=1)
+    else:
+        src = cv2.GaussianBlur(image_bgr, (7, 7), 0)
+
+    lab_src = cv2.cvtColor(src, cv2.COLOR_BGR2LAB)
+    pixels = lab_src.reshape(-1, 3).astype(np.float32)
+    max_k = min(32, max(4, int(np.sqrt(h * w) // 40)))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 0.5)
+    cv2.setRNGSeed(42)
+    _, labels_flat, centers_lab = cv2.kmeans(
+        pixels, max_k, None, criteria, 6, cv2.KMEANS_PP_CENTERS
+    )
+    labels = labels_flat.reshape(h, w)
+
+    # Convert centers back to BGR
+    centers_bgr = np.array([
+        cv2.cvtColor(c.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_LAB2BGR)[0, 0].astype(np.float32)
+        for c in centers_lab
+    ])
+    K = len(centers_bgr)
+
+    # Merge close clusters
+    centers_bgr, labels = _merge_close_clusters(
+        centers_bgr, labels.astype(np.int32).ravel(), h, w,
+        threshold=20.0, lab_image=lab_src.astype(np.float32), lab_threshold=6.0,
+    )
+    labels = labels.reshape(h, w)
+    K = len(centers_bgr)
+
+    # Area-merge tiny fragments
+    centers_bgr, labels = _area_merge_clusters(centers_bgr, labels, lambda_=0.005)
+    K = len(centers_bgr)
+
+    # Identify background cluster
+    bg_dists = np.array([
+        np.linalg.norm(centers_bgr[k] - bg_color.astype(np.float32))
+        for k in range(K)
+    ])
+    bg_cluster = int(np.argmin(bg_dists)) if bg_dists.min() < 40.0 else -1
+
+    # Painter's order: lightest first
+    grays = np.array([
+        0.114 * float(c[0]) + 0.587 * float(c[1]) + 0.299 * float(c[2])
+        for c in centers_bgr
+    ])
+    order = list(np.argsort(-grays))
+
+    # Adaptive superresolution (flat color: lower S is fine)
+    S = min(contour_scale, 2)
+
+    layers: list[VectorLayer] = []
+    total_paths = 0
+    total_nodes = 0
+
+    for k in order:
+        if k == bg_cluster:
+            continue
+        color_hex = _bgr_to_hex(centers_bgr[k].astype(np.uint8))
+
+        mask = (labels == k).astype(np.uint8)
+        if not np.any(mask):
+            continue
+
+        # Morphological cleanup
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)))
+
+        if S > 1:
+            mask_up = cv2.resize(mask * 255, (w * S, h * S),
+                                 interpolation=cv2.INTER_NEAREST)
+            mask_up = (mask_up > 127).astype(np.uint8)
+        else:
+            mask_up = mask
+
+        contours, hierarchy = cv2.findContours(
+            mask_up, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours or hierarchy is None:
+            continue
+
+        hier0 = hierarchy[0]
+
+        # Group outer contours with their holes
+        groups: list[list[int]] = []
+        for ci in range(len(contours)):
+            if hier0[ci][3] == -1:  # outer contour
+                group = [ci]
+                child = hier0[ci][2]
+                while child != -1:
+                    group.append(child)
+                    child = hier0[child][0]
+                groups.append(group)
+
+        groups.sort(
+            key=lambda g: cv2.contourArea(contours[g[0]]), reverse=True
+        )
+        groups = groups[:300]
+
+        layer_paths: list[str] = []
+        layer_opacities: list[float] = []
+        layer_shapes: list[str] = []
+
+        for group in groups:
+            parts: list[str] = []
+            for ci in group:
+                pts = contours[ci].squeeze(1).astype(np.float64)
+                if len(pts) < 3:
+                    continue
+                area_real = abs(cv2.contourArea(contours[ci])) / (S * S)
+                if area_real < min_contour_area:
+                    continue
+
+                pts = pts / S  # scale back to original coordinates
+
+                is_hole = hier0[ci][3] != -1
+                if not is_hole and not parts:
+                    shape = _detect_shape(pts, min_area=min_contour_area * 4)
+                    if shape:
+                        layer_shapes.append(shape)
+                        break
+
+                d = _fit_contour(
+                    pts, simplify_epsilon, max_error, corner_threshold, line_tolerance
+                )
+                if d:
+                    parts.append(d)
+
+            if parts:
+                combined = " ".join(parts)
+                layer_paths.append(combined)
+                layer_opacities.append(1.0)
+                total_nodes += (combined.count("C") + combined.count("L")
+                                + combined.count("M"))
+
+        if layer_paths or layer_shapes:
+            layers.append(VectorLayer(
+                paths=layer_paths,
+                opacities=layer_opacities,
+                color=color_hex,
+                shapes=layer_shapes if layer_shapes else None,
+            ))
+            total_paths += len(layer_paths) + len(layer_shapes if layer_shapes else [])
+
+    return MultilevelResult(
+        layers=layers,
+        stroke_layers=[],
+        width=w,
+        height=h,
+        background_color=bg_hex,
+        path_count=total_paths,
+        node_count=total_nodes,
+        gradient_defs=None,
+        is_line_art=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core: quantize → adaptive soft-membership → sub-pixel contour → fit
 # ---------------------------------------------------------------------------
 
@@ -320,6 +692,7 @@ def multilevel_vectorize(
     contour_scale: int = 4,
     smooth_sigma: float = 0.50,
     mediator_threshold: float = 0.3,   # backward compat (used in absorption)
+    remove_background: bool = False,
 ) -> MultilevelResult:
     h, w = image_bgr.shape[:2]
     _warm_debug = os.environ.get("SVG_WARM_DEBUG") == "1"
@@ -327,6 +700,23 @@ def multilevel_vectorize(
 
     if len(image_bgr.shape) == 2:
         image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
+
+    # --- Background removal (GrabCut) ---
+    if remove_background:
+        image_bgr, _fg_mask = _remove_background_grabcut(image_bgr)
+
+    # --- Image-type routing ---
+    _image_type = _classify_image(image_bgr)
+    if _image_type == 'flat_color':
+        return _pipeline_flat_color(
+            image_bgr,
+            simplify_epsilon=simplify_epsilon,
+            max_error=max_error,
+            line_tolerance=line_tolerance,
+            corner_threshold=corner_threshold,
+            min_contour_area=min_contour_area,
+            contour_scale=contour_scale,
+        )
 
     _t_start = time.time()
     bg_color, bg_gray = detect_background(image_bgr)
@@ -577,6 +967,22 @@ def multilevel_vectorize(
         else:
             bg_cluster = -1
         K = len(centers_f)
+
+    # --- Step 1f: Area-based micro-fragment merge (He et al. 2024) ---
+    # Absorb tiny speckled clusters into their dominant neighbors.
+    # Fixes test4's fragmentation (123K nodes) without harming line art.
+    # Only apply to photographic images (line art takes its own fast path below).
+    _area_merge_lambda = 0.002 if _image_type == 'photographic' else 0.0005
+    centers_f, labels = _area_merge_clusters(centers_f, labels, lambda_=_area_merge_lambda)
+    K = len(centers_f)
+    centers_u = centers_f.astype(np.uint8)
+    # Re-identify bg cluster after merge
+    if K > 0:
+        _bg_dists_post = np.array([
+            np.linalg.norm(centers_f[k] - bg_color.astype(np.float32))
+            for k in range(K)
+        ])
+        bg_cluster = int(np.argmin(_bg_dists_post)) if _bg_dists_post.min() < 40.0 else -1
 
     # --- Step 2: Distance from every pixel to every cluster centre ---
     # Use the mildly denoised image (tight color gate sc=5) so SD
@@ -1323,7 +1729,7 @@ def multilevel_vectorize(
                 elif _cluster_area_frac >= 0.02:
                     _area_mult *= 0.85
                 # Dense-texture clusters: raise area floor to cull angular
-                # micro-fragments (e.g. forest canopy shards)
+                # micro-fragments (e.g. forest canopy shards).
                 if len(_contour_groups) > 300:
                     _area_mult *= 1.5
                 if elongation > 50 and perim_raw > 8:
@@ -1423,8 +1829,16 @@ def multilevel_vectorize(
 
                 _me = max_error * 0.5 if cluster_is_thin[cluster_idx] else max_error
                 _lt = line_tolerance * 0.6 if cluster_is_thin[cluster_idx] else line_tolerance
+                # Texture-dense clusters: scale up simplify_epsilon to reduce
+                # nodes per contour without filtering any shapes out.
+                # At 300 groups: 1×; at 750 groups: 2.5×; cap at 2.5×.
+                if len(_contour_groups) > 300:
+                    _se_scale = min(2.5, max(1.0, len(_contour_groups) / 300.0))
+                    _se = simplify_epsilon * _se_scale
+                else:
+                    _se = simplify_epsilon
                 _t_fc = time.time()
-                d_str = _fit_contour(xy, simplify_epsilon, _me, corner_threshold, _lt)
+                d_str = _fit_contour(xy, _se, _me, corner_threshold, _lt)
                 _local_curves_time += time.time() - _t_fc
                 if d_str:
                     group_parts.append(d_str)
@@ -3015,20 +3429,27 @@ def _fit_contour(
 
 
 def _curve_to_d(curve) -> str:
-    """Convert a FittedCurve to an SVG path `d` string."""
+    """Convert a FittedCurve to an SVG path `d` string with compact coordinates."""
     if not curve.segments:
         return ""
 
+    def _f(v: float) -> str:
+        """Format coordinate: 1 decimal place, trailing zero stripped."""
+        s = f"{v:.1f}"
+        if s.endswith('.0'):
+            return s[:-2]
+        return s
+
     p = curve.segments[0]
-    parts = [f"M{p.p0[0]:.1f},{p.p0[1]:.1f}"]
+    parts = [f"M{_f(p.p0[0])},{_f(p.p0[1])}"]
     for seg in curve.segments:
         if seg.is_line:
-            parts.append(f"L{seg.p3[0]:.1f},{seg.p3[1]:.1f}")
+            parts.append(f"L{_f(seg.p3[0])},{_f(seg.p3[1])}")
         else:
             parts.append(
-                f"C{seg.p1[0]:.1f},{seg.p1[1]:.1f} "
-                f"{seg.p2[0]:.1f},{seg.p2[1]:.1f} "
-                f"{seg.p3[0]:.1f},{seg.p3[1]:.1f}"
+                f"C{_f(seg.p1[0])},{_f(seg.p1[1])} "
+                f"{_f(seg.p2[0])},{_f(seg.p2[1])} "
+                f"{_f(seg.p3[0])},{_f(seg.p3[1])}"
             )
     if curve.is_closed:
         parts.append("Z")

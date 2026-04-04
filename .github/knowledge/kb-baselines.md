@@ -1,8 +1,18 @@
 # Current Baselines (source of truth)
 
-Last updated: March 2026 (after intensity-based fringe split on line art + 4-point subdivision + soft competing distance + render color re-estimation)
+Last updated: 2026 (after image classification routing, GrabCut background removal, flat-color pipeline, area merge, adaptive simplify_epsilon scaling)
 
 ## Default mode (compare_all.py)
+
+| Image | Res       | Feat% | Miss% | Xtra% | WdErr  | MnDif | Time | Nodes   | SVG_KB |
+| ----- | --------- | ----- | ----- | ----- | ------ | ----- | ---- | ------- | ------ |
+| Ref   | 1536×1024 | 90.6  | 5.6   | 27.6  | +0.04  | 5.22  | 32s  | 10,266  | 174    |
+| test2 | 4016×2256 | 96.7  | 1.0   | 2.6   | +25.61 | 11.01 | 37s  | 18,665  | 373    |
+| test3 | 6124×4082 | 86.7  | 5.1   | 14.6  | +11.16 | 1.65  | 78s  | 14,013  | 240    |
+| test4 | 3310×2481 | 90.9  | 4.0   | 2.3   | +2.54  | 15.66 | 49s  | 113,802 | 2176   |
+| test5 | 3888×2592 | 82.8  | 3.3   | 6.8   | +5.01  | 10.23 | 58s  | 48,782  | 1026   |
+
+### Previous baseline (March 2026, pre-routing)
 
 | Image | Res       | Feat% | Miss% | Xtra% | WdErr  | MnDif | Time | Nodes   | SVG_KB |
 | ----- | --------- | ----- | ----- | ----- | ------ | ----- | ---- | ------- | ------ |
@@ -22,7 +32,17 @@ Last updated: March 2026 (after intensity-based fringe split on line art + 4-poi
 | test4 | 90.7  | 4.8   | 2.3   | +1.77  | 16.74 | 130,040 | 2570   |
 | test5 | 83.7  | 3.1   | 6.9   | +9.10  | 10.42 | 57,436  | 1287   |
 
-### Key changes from prior baseline
+### Key changes from current baseline (2026 routing overhaul)
+
+- **Image classification routing** (`_classify_image`): line_art | flat_color | photographic routing at top of `multilevel_vectorize`. Safe flat_color thresholds: `mean_grad<0.03 AND edge_frac<0.04 AND n_unique<30`. test3 (sparse botanical ink) correctly routes to photographic despite low-gradient appearance.
+- **GrabCut background removal** (`_remove_background_grabcut` + `_fg_by_flood_fill`): opt-in via `remove_background=True`, exposed in API and frontend toggle. Uses iterative GrabCut with flood-fill seed for transparent background extraction.
+- **Flat-color fast pipeline** (`_pipeline_flat_color`): for logos, seating maps, diagrams. K-means → binary masks → cv2.findContours → Bézier fitting. No soft-field computation (major speed gain). Triggers on `mean_grad<0.03 AND edge_frac<0.04 AND n_unique<30`.
+- **Area merge** (`_area_merge_clusters`): He et al. 2024 LAB-space merge. Merges clusters where `min(area_i,area_j) × LAB_dist² < lambda_ × total_area × 100`. lambda_=0.002 (photographic), 0.0005 (line_art). Conservative — 0.62s for 25MP. Reduces cluster count for fragmented images.
+- **Adaptive simplify_epsilon scaling**: For clusters with >300 groups, `_se = simplify_epsilon × min(2.5, N/300)`. Reduces nodes per contour WITHOUT filtering any contours → doesn't hurt WdErr. **test3 WdErr 12.11→11.16 (-0.95), test5 WdErr 6.48→5.01 (-1.47)**. Minor Feat% regressions (-0.6 to -0.8pp across test3/4/5).
+- `_curve_to_d` coordinate precision: `.1f` format with trailing-zero stripping (saves SVG bytes).
+- test2/4 minor Feat% regression (-0.5 to -0.7pp) from area_merge Step 1f — tradeoff for WdErr improvements.
+
+### Key changes from pre-subdivision baseline
 
 - Bézier fitter now produces REAL cubic curves (alpha clamp 1.5x, tangent span=3)
 - line_tolerance: 1.2 → 0.5 (more curves, fewer straight lines)
