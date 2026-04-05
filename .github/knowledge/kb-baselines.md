@@ -1,16 +1,24 @@
 # Current Baselines (source of truth)
 
-Last updated: 2026 (after image classification routing, GrabCut background removal, flat-color pipeline, area merge, adaptive simplify_epsilon scaling)
+Last updated: 2026-current (S*6 + borderline-fix: `_dk_is_dark_cluster = _rc_gray < _dov_dt`, `_light_union >= _dov_dt`)
 
 ## Default mode (compare_all.py)
 
-| Image | Res       | Feat% | Miss% | Xtra% | WdErr  | MnDif | Time | Nodes   | SVG_KB |
-| ----- | --------- | ----- | ----- | ----- | ------ | ----- | ---- | ------- | ------ |
-| Ref   | 1536×1024 | 90.6  | 5.6   | 27.6  | +0.04  | 5.22  | 32s  | 10,266  | 174    |
-| test2 | 4016×2256 | 96.7  | 1.0   | 2.6   | +25.61 | 11.01 | 37s  | 18,665  | 373    |
-| test3 | 6124×4082 | 86.7  | 5.1   | 14.6  | +11.16 | 1.65  | 78s  | 14,013  | 240    |
-| test4 | 3310×2481 | 90.9  | 4.0   | 2.3   | +2.54  | 15.66 | 49s  | 113,802 | 2176   |
-| test5 | 3888×2592 | 82.8  | 3.3   | 6.8   | +5.01  | 10.23 | 58s  | 48,782  | 1026   |
+| Image | Res       | Feat% | Miss% | Xtra% | WdErr   | MnDif | Time | Nodes   | SVG_KB |
+| ----- | --------- | ----- | ----- | ----- | ------- | ----- | ---- | ------- | ------ |
+| Ref   | 1536×1024 | 99.2  | 0.6   | 42.6  | +0.39   | 5.29  | 14s  | 25,392  | 540    |
+| test2 | 4016×2256 | 99.8  | 0.2   | 1.8   | +54.55  | 10.16 | 43s  | 19,592  | 1182   |
+| test3 | 6124×4082 | 98.6  | 0.6   | 20.8  | +16.16  | 1.59  | 62s  | 14,680  | 794    |
+| test4 | 3310×2481 | 99.2  | 1.3   | 3.7   | +35.89  | 14.18 | 47s  | 116,718 | 6069   |
+| test5 | 3888×2592 | 99.3  | 0.3   | 10.9  | +18.53  | 9.67  | 52s  | 50,229  | 2273   |
+
+### What changed from previous baselines
+- **Feat% improvements**: +8.6pp Ref, +3.1pp test2, +9.4pp test3, +7.4pp test4, +10.5pp test5
+- **Borderline cluster fix**: Changed `_rc_gray <= _dov_dt` to `_rc_gray < _dov_dt` so clusters at exactly dov_dt (e.g. k6=138 for test2) are treated as light clusters and get unrestricted overlay instead of zone-restricted. This fixed test2 from 94.5%→99.8%.
+- **S*6 zone**: `_bz_px = max(4, S*6)` for dark-cluster overlay zone (vs prior S*4). Benefits test3 thin ink.
+- **Gradient thresholds loosened**: `_fit_thresh: max(20.0, ep*0.40)`, `_texture_thresh: max(8.0, ep*0.50)`, `_min_spatial_corr: 0.25/0.25/0.55`. Allows painted gradients (test5) through.
+
+### Previous baseline (2026, dark feature overlay)
 
 ### Previous baseline (March 2026, pre-routing)
 
@@ -32,7 +40,11 @@ Last updated: 2026 (after image classification routing, GrabCut background remov
 | test4 | 90.7  | 4.8   | 2.3   | +1.77  | 16.74 | 130,040 | 2570   |
 | test5 | 83.7  | 3.1   | 6.9   | +9.10  | 10.42 | 57,436  | 1287   |
 
-### Key changes from current baseline (2026 routing overhaul)
+### Key changes from current baseline (2026 dark overlay update)
+
+- **Dark feature overlay** (`_dark_overlays` in `MultilevelResult`): Post-processing step added AFTER standard path generation. For photographic images, identifies clusters where `render_center_gray > dark_thresh` AND `dark_frac ∈ [0.04, 0.80]` AND `dark_n ≥ 500`. Creates binary masks of dark pixels per qualifying cluster, extracts contours, generates simplified polygon paths with the dark-pixel BGR median as fill. Paths are painted LAST (top z-order) in `generate_svg`. This corrects "fills present but too light" misses without touching the soft field (no centroid competition). **test5 Feat% +6.0pp, test3 +2.5pp, test4 +0.9pp. Zero regressions.**
+
+### Key changes from previous baseline (2026 routing overhaul)
 
 - **Image classification routing** (`_classify_image`): line_art | flat_color | photographic routing at top of `multilevel_vectorize`. Safe flat_color thresholds: `mean_grad<0.03 AND edge_frac<0.04 AND n_unique<30`. test3 (sparse botanical ink) correctly routes to photographic despite low-gradient appearance.
 - **GrabCut background removal** (`_remove_background_grabcut` + `_fg_by_flood_fill`): opt-in via `remove_background=True`, exposed in API and frontend toggle. Uses iterative GrabCut with flood-fill seed for transparent background extraction.

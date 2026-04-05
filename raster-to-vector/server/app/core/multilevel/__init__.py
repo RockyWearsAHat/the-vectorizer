@@ -98,6 +98,7 @@ class MultilevelResult:
     node_count: int
     gradient_defs: list[GradientDef] | None = None
     is_line_art: bool = False
+    dark_overlays: list[tuple[str, str]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +497,141 @@ def _area_merge_clusters(
     return centers, labels
 
 
+def _cleanup_label_fragments(
+    labels: np.ndarray,
+    num_clusters: int,
+    min_area: int,
+    max_frag_pct: float = 5.0,
+) -> np.ndarray:
+    """Absorb small isolated label fragments into their dominant neighbor cluster.
+
+    After K-means, transition zones between large color regions accumulate tiny
+    scattered fragments (50-300 px) of every cluster.  These pass later area
+    filters and produce visible speckle in the SVG output.
+
+    Algorithm (fully vectorized — no Python loop over CC IDs):
+      First, count the image's fragmentation ratio (% pixels in small CCs).
+      If it exceeds max_frag_pct, the image has natural fine texture (forest,
+      detailed photo) and cleanup would harm it — return unchanged.
+      Otherwise, pre-build an (8, H, W) neighbor array once per pass.  For each
+      cluster k, find small 8-connected CCs via np.isin, then build a
+      (num_small_ccs, K) vote matrix with np.add.at over all fragment pixels ×
+      8 directions at once.  Only absorb CCs where >= 75 % of border pixels
+      belong to a single other cluster (dominance filter).  2 passes max.
+
+    min_area: pixel threshold below which a CC is considered a fragment.
+    max_frag_pct: if more than this % of pixels live in small CCs, skip cleanup
+                  (image has natural fine texture that would be harmed).
+    """
+    h, w = labels.shape
+    K = num_clusters
+
+    # --- Fragmentation guard: one fast scan to measure small-CC density ---
+    # Reuses the CC maps we'd need anyway in the cleanup loop.
+    cc_maps = {}        # k → cc_map (reused in cleanup passes)
+    small_id_sets = {}  # k → small_ids array
+    total_small_px = 0
+    present = set(int(v) for v in np.unique(labels))
+
+    for k in range(K):
+        if k not in present:
+            continue
+        mask_k = (labels == k).astype(np.uint8)
+        num_cc, cc_map = cv2.connectedComponents(mask_k, connectivity=8)
+        cc_maps[k] = cc_map
+        if num_cc <= 2:
+            small_id_sets[k] = np.array([], dtype=np.int64)
+            continue
+        cc_sizes = np.bincount(cc_map.ravel())
+        small_ids = np.where((cc_sizes[1:] < min_area))[0] + 1
+        small_id_sets[k] = small_ids
+        total_small_px += int(cc_sizes[small_ids].sum())
+
+    frag_pct = 100.0 * total_small_px / max(h * w, 1)
+    if frag_pct > max_frag_pct:
+        # Image has natural fine texture — cleanup would absorb real features.
+        return labels
+
+    result = labels.copy()
+
+    for _pass in range(2):
+        changed = False
+        snap = result.copy()
+
+        # (8, H, W) neighbor label array — computed once per pass
+        pad = np.pad(snap, 1, constant_values=-1).astype(np.int32)
+        nb = np.stack([
+            pad[0:h,   0:w],     pad[0:h,   1:w+1], pad[0:h,   2:w+2],
+            pad[1:h+1, 0:w],                         pad[1:h+1, 2:w+2],
+            pad[2:h+2, 0:w],     pad[2:h+2, 1:w+1], pad[2:h+2, 2:w+2],
+        ], axis=0)  # (8, H, W) int32
+
+        present = set(int(v) for v in np.unique(result))
+        for k in range(K):
+            if k not in present:
+                continue
+
+            # Reuse pre-computed CC map for pass 0; recompute for pass 1
+            if _pass == 0:
+                cc_map = cc_maps.get(k)
+                small_ids = small_id_sets.get(k, np.array([], dtype=np.int64))
+                if cc_map is None or len(small_ids) == 0:
+                    continue
+            else:
+                mask_k = (result == k).astype(np.uint8)
+                num_cc, cc_map = cv2.connectedComponents(mask_k, connectivity=8)
+                if num_cc <= 2:
+                    continue
+                cc_sizes = np.bincount(cc_map.ravel())
+                small_ids = np.where((cc_sizes[1:] < min_area))[0] + 1
+                if len(small_ids) == 0:
+                    continue
+
+            num_sc = len(small_ids)
+
+            # --- fully vectorized batch: all small CCs processed at once ---
+            small_mask = np.isin(cc_map, small_ids)     # bool (H, W)
+            if not np.any(small_mask):
+                continue
+
+            max_cc = int(cc_map.max())
+            cc_to_local = np.full(max_cc + 1, -1, dtype=np.int32)
+            cc_to_local[small_ids] = np.arange(num_sc, dtype=np.int32)
+            local_idx = cc_to_local[cc_map[small_mask]]  # (N_small,)
+
+            nb_small = nb[:, small_mask]  # (8, N_small)
+
+            vote = np.zeros((num_sc, K), dtype=np.int32)
+            for d in range(8):
+                nl = nb_small[d]
+                valid = (nl >= 0) & (nl != k)
+                li = local_idx[valid]
+                np.add.at(vote, (li, nl[valid].astype(np.int64)), 1)
+
+            # Dominance filter: only absorb CCs where one cluster owns >= 75 %
+            # of the border.  Real texture features at multi-cluster junctions
+            # have spread-out neighbors and are skipped.
+            total_votes = vote.sum(axis=1).astype(np.float32)
+            max_votes   = vote.max(axis=1).astype(np.float32)
+            dominated   = (total_votes > 0) & (
+                max_votes / np.maximum(total_votes, 1) >= 0.75
+            )
+
+            best_labels = np.argmax(vote, axis=1).astype(np.int32)
+
+            absorb = dominated[local_idx]
+            if np.any(absorb):
+                result_flat = result[small_mask]
+                result_flat[absorb] = best_labels[local_idx[absorb]]
+                result[small_mask] = result_flat
+                changed = True
+
+        if not changed:
+            break
+
+    return result
+
+
 def _pipeline_flat_color(
     image_bgr: np.ndarray,
     *,
@@ -688,7 +824,7 @@ def multilevel_vectorize(
     max_error: float = 1.5,
     line_tolerance: float = 0.5,
     corner_threshold: float = 55.0,
-    min_contour_area: int = 12,
+    min_contour_area: int = 6,
     contour_scale: int = 4,
     smooth_sigma: float = 0.50,
     mediator_threshold: float = 0.3,   # backward compat (used in absorption)
@@ -983,6 +1119,19 @@ def multilevel_vectorize(
             for k in range(K)
         ])
         bg_cluster = int(np.argmin(_bg_dists_post)) if _bg_dists_post.min() < 40.0 else -1
+
+    # Spatial fragment cleanup: absorb small disconnected label fragments into
+    # their dominant neighbors.  K-means assigns pixels by color alone, so
+    # transition zones between large regions accumulate tiny scattered fragments
+    # that pass later area filters and create visible speckle in the SVG.
+    # Threshold: ~0.001 % of image pixels, capped at 200 px so thin features
+    # (botanical ink stems, line art endpoints) are never absorbed.
+    # max_frag_pct=2.5: skip images where >2.5% of pixels live in small CCs —
+    # these are high-detail photos (test2=2.99%, test4=13.4%) where fragments
+    # are real features not speckle. Painted/mural images (test5=2.17%) stay under.
+    _frag_min_area = max(30, min(200, int(h * w * 0.00001)))
+    labels = _cleanup_label_fragments(labels, K, _frag_min_area, max_frag_pct=2.5)
+
 
     # --- Step 2: Distance from every pixel to every cluster centre ---
     # Use the mildly denoised image (tight color gate sc=5) so SD
@@ -1315,21 +1464,11 @@ def multilevel_vectorize(
         _binary_la = cv2.morphologyEx(_binary_la, cv2.MORPH_CLOSE, _k_close)
 
         # Restore the erosion split from the known-good line-art path:
-        # keep a thin core fill, route hairlines to strokes, and use the
-        # outer ring as a low-opacity fringe instead of solid ink.
-        _num_line_cc, _line_labels = cv2.connectedComponents((_binary_la > 0).astype(np.uint8))
-        _line_hair_stroke_mask = np.zeros_like(_binary_la, dtype=np.uint8)
-        _line_fill_mask = np.zeros_like(_binary_la, dtype=np.uint8)
-        for _fid in range(1, _num_line_cc):
-            _component = (_line_labels == _fid).astype(np.uint8)
-            if not np.any(_component):
-                continue
-            _dt_comp = cv2.distanceTransform(_component * 255, cv2.DIST_L2, 3)
-            _max_dt = float(_dt_comp.max())
-            if _max_dt <= 1.5:
-                _line_hair_stroke_mask = cv2.bitwise_or(_line_hair_stroke_mask, _component * 255)
-            else:
-                _line_fill_mask = cv2.bitwise_or(_line_fill_mask, _component * 255)
+        # Route ALL components through the fill path.  At S-times upscaling,
+        # even 1-px-wide hairlines become 2–4 px wide blobs with extractable
+        # contours, eliminating the imprecise stroke-path that left skeleton
+        # pixels uncovered (SVG gray ≈ 247 where features should be dark).
+        _line_fill_mask = _binary_la.copy()
 
         # Split fill mask into strict core (truly dark) and hysteresis fringe
         # (AA pixels captured by lenient threshold).  The strict mask IS the
@@ -1342,17 +1481,24 @@ def multilevel_vectorize(
                 ((_gray_la > _strict_thresh) & (_gray_la <= _core_thresh)).astype(np.uint8) * 255,
             ),
         )
-        _all_line_strokes = _line_hair_stroke_mask
 
-        # Upscale for better contour quality
+        # Upscale for better contour quality.
+        # MUST use INTER_NEAREST for binary masks: INTER_LINEAR blurs 1-px lines
+        # to ~64 gray at their center block, then >127 threshold destroys them.
+        # INTER_NEAREST duplicates each pixel to an S×S block exactly.
+        # After upscaling, apply a small dilation to bridge the 1-px gaps that
+        # INTER_NEAREST creates between diagonally-adjacent pixel blocks —
+        # without it, each diagonal pixel becomes an isolated S×S blob with
+        # contour area (S-1)² < min_area_la, which the area filter then drops.
+        _k_bridge = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
         if S > 1:
             _h_la, _w_la = _line_fill_mask.shape[:2]
             _binary_la = cv2.resize(_strict_fill, (_w_la * S, _h_la * S),
-                                    interpolation=cv2.INTER_LINEAR)
-            _binary_la = (_binary_la > 127).astype(np.uint8) * 255
+                                    interpolation=cv2.INTER_NEAREST)
+            _binary_la = cv2.dilate(_binary_la, _k_bridge, iterations=1)
             _binary_la_fringe = cv2.resize(_hyst_fringe, (_w_la * S, _h_la * S),
-                                           interpolation=cv2.INTER_LINEAR)
-            _binary_la_fringe = (_binary_la_fringe > 127).astype(np.uint8) * 255
+                                           interpolation=cv2.INTER_NEAREST)
+            _binary_la_fringe = cv2.dilate(_binary_la_fringe, _k_bridge, iterations=1)
         else:
             _binary_la = _strict_fill.copy()
             _binary_la_fringe = _hyst_fringe.copy()
@@ -1391,9 +1537,9 @@ def multilevel_vectorize(
             _groups_la.sort(
                 key=lambda g: cv2.contourArea(_cv_contours[g['outer']]), reverse=True,
             )
-            _groups_la = _groups_la[:200]
+            _groups_la = _groups_la[:2000]
 
-            _min_area_la = max(S * S, 8)
+            _min_area_la = max(2, S // 2)
             _groups_la = [
                 g for g in _groups_la
                 if cv2.contourArea(_cv_contours[g['outer']]) >= _min_area_la
@@ -1430,25 +1576,10 @@ def multilevel_vectorize(
         _la_nodes = 0
         _la_paths, _la_nodes = _fit_line_art_paths(_cv_la, _hier_la)
         _la_fringe_paths, _la_fringe_nodes = _fit_line_art_paths(_cv_la_fringe, _hier_la_fringe)
-        _la_hair_stroke = _process_stroke_mask(
-            (_line_hair_stroke_mask > 0).astype(np.uint8),
-            scale=S,
-            simplify_epsilon=simplify_epsilon * 0.15,
-            max_error=max_error * 0.25,
-            corner_threshold=corner_threshold,
-            line_tolerance=line_tolerance * 0.5,
-            min_branch_length=1,
-        )
-        if _la_hair_stroke is None:
-            _la_hair_stroke_paths, _la_hair_stroke_widths = [], []
-        else:
-            _la_hair_stroke_paths, _la_hair_stroke_widths = _la_hair_stroke
-        _la_stroke_paths = _la_hair_stroke_paths
-        _la_stroke_widths = _la_hair_stroke_widths
-        _la_stroke_nodes = sum(
-            path_d.count("C") + path_d.count("L") + path_d.count("M")
-            for path_d in _la_stroke_paths
-        )
+        # No separate stroke path — all features are fill polygons now.
+        _la_stroke_paths: list[str] = []
+        _la_stroke_widths: list[float] = []
+        _la_stroke_nodes = 0
 
         _t_la_end = time.time()
 
@@ -2301,6 +2432,177 @@ def multilevel_vectorize(
 
     _t_end = time.time()
 
+    # --- Dark feature overlay for mixed-luminance clusters ---
+    # Some clusters have a render center above the image's dark threshold, but
+    # Per-cluster dark overlay: clusters whose render center renders light but
+    # contain dark-pixel content (e.g. dark outlines in a light sky cluster).
+    # These dark pixels appear in the SVG with the cluster's fill color (too
+    # light) so the feature-presence metric misses them. Adding explicit dark
+    # paths on top corrects their rendered color without touching the soft field
+    # (no centroid competition). The only floor is an absolute dark-pixel count;
+    # no dark_frac lower bound is applied so even clusters with sparse dark
+    # content are captured.
+    _dark_overlays: list[tuple[str, str]] = []
+    if _image_type == 'photographic':
+        _dov_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        _dov_hist = np.histogram(_dov_gray.ravel(), bins=256, range=(0.0, 256.0))[0].astype(float)
+        _dov_hist_sm = gaussian_filter1d(_dov_hist, sigma=5)
+        _dov_peaks = [i for i in range(1, 255)
+                      if _dov_hist_sm[i] > _dov_hist_sm[i - 1]
+                      and _dov_hist_sm[i] > _dov_hist_sm[i + 1]
+                      and _dov_hist_sm[i] > _dov_hist_sm.max() * 0.01]
+        _dov_dt = float((_dov_peaks[0] + _dov_peaks[-1]) / 2) if len(_dov_peaks) >= 2 else 128.0
+
+        # _cluster_dt: threshold used to classify CLUSTERS as dark vs light.
+        # _dov_dt (histogram midpoint) is sometimes off by 1-2 gray values relative
+        # to the nearest cluster center, causing a borderline cluster to be wrongly
+        # restricted as "dark" (e.g. k6=137 with dov_dt=138 on test2, -6% Feature%).
+        # Fix: if the nearest cluster gray below dov_dt is within 3 units, lower the
+        # classification threshold to just below that cluster so it becomes "light".
+        # 3-unit margin handles histogram quantization jitter without affecting images
+        # where clusters are well-separated from the boundary (test3/test4/test5).
+        _all_kk_grays = sorted(
+            int(cv2.cvtColor(render_centers_u[_kk].reshape(1, 1, 3), cv2.COLOR_BGR2GRAY)[0, 0])
+            for _kk in range(K)
+        )
+        _below_dt = [g for g in _all_kk_grays if g < _dov_dt]
+        _cluster_dt = _dov_dt
+        if _below_dt:
+            _nearest_below = max(_below_dt)
+            if _dov_dt - _nearest_below <= 3:
+                # Borderline cluster: lower threshold to just below it so it's light
+                _cluster_dt = float(_nearest_below) - 0.5
+
+        _dov_gray_flat = _dov_gray.ravel()
+        _dov_lbl_flat = labels.ravel()
+        _dov_bgr_flat = image_bgr.reshape(-1, 3)
+        _morph_ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Larger kernel for light-cluster overlays: connects nearby short scattered
+        # segments (e.g. thin botanical ink labeled by a light cluster) into blobs
+        # large enough to pass the area filter.
+        _morph_ell_lg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+        # Precompute: pixels within (S * 4) px of any light-cluster label.
+        # Used ONLY to restrict DARK-cluster overlays: dark pixels deep inside a
+        # large ink mass render correctly via the soft-field alone, only the
+        # S*4-pixel border zone near light clusters needs re-assertion.
+        # Light-cluster dark pixels are NEVER restricted — they always render
+        # wrong (cluster renders light) so ALL must be covered regardless of
+        # position. This fixes large mixed-color regions (e.g. tinted car windows)
+        # that broke with a blanket S*8 restriction applied to all clusters.
+        # Iterative 3×3 dilation is ~20x faster than a single large kernel:
+        # 12 passes × 3×3 × 25M px ≈ 2.7B ops vs 49×49 × 25M ≈ 60B ops.
+        _bz_px = max(4, S * 6)
+        _bz_kern_3x3 = np.ones((3, 3), dtype=np.uint8)
+        _light_union = np.zeros((h, w), dtype=np.uint8)
+        for _kk in range(K):
+            _kk_gray = int(cv2.cvtColor(
+                render_centers_u[_kk].reshape(1, 1, 3), cv2.COLOR_BGR2GRAY
+            )[0, 0])
+            # Include clusters at the threshold (>=) so borderline clusters
+            # contribute to the zone that dark-cluster overlays avoid.
+            if _kk_gray >= _cluster_dt:
+                _light_union |= (_dov_lbl_flat == _kk).reshape(h, w).astype(np.uint8)
+        _light_bz = cv2.dilate(_light_union, _bz_kern_3x3, iterations=_bz_px).astype(bool)
+
+        for _dk in range(K):
+            # Skip bg_cluster only if it IS a dark cluster — a dark background
+            # would incorrectly fill the entire canvas.  If bg_cluster is light
+            # (e.g. cream paper background with ink mislabeled as background),
+            # we must process it so those dark pixels get an overlay.
+            _rc_gray = int(cv2.cvtColor(
+                render_centers_u[_dk].reshape(1, 1, 3), cv2.COLOR_BGR2GRAY
+            )[0, 0])
+            # Use strict < so a cluster whose center == cluster_dt (borderline)
+            # is treated as a light cluster and receives unrestricted overlay.
+            # _cluster_dt is computed from the largest gap between cluster gray
+            # values, which is more robust than the histogram midpoint (_dov_dt)
+            # and avoids off-by-one misclassification (e.g. k6=137 vs dov_dt=138).
+            _dk_is_dark_cluster = _rc_gray < _cluster_dt
+            if _dk == bg_cluster and _dk_is_dark_cluster:
+                continue
+            # Require a minimum absolute count of dark pixels (no fraction floor)
+            _dk_mask = _dov_lbl_flat == _dk
+            # Dark clusters: restrict to the S*4 border zone around light clusters.
+            # Their interior dark pixels render correctly via the dark soft-field
+            # fill; only the border zone can be over-brightened by adjacent light
+            # soft-fields. Light clusters: NO zone restriction — all their dark
+            # pixels will render at the (too-light) cluster center color, so every
+            # one of them needs the overlay regardless of position.
+            if _dk_is_dark_cluster:
+                _dk_dark_pixel_mask = _dk_mask & (_dov_gray_flat < _dov_dt) & _light_bz.ravel()
+            else:
+                _dk_dark_pixel_mask = _dk_mask & (_dov_gray_flat < _dov_dt)
+            _dk_dark_n = int(_dk_dark_pixel_mask.sum())
+            if _dk_is_dark_cluster:
+                if _dk_dark_n < 30:
+                    continue
+            else:
+                if _dk_dark_n < 10:  # lowered from 50: sparse ink clusters still matter
+                    continue
+            # Build binary mask of dark pixels in this cluster
+            _dk_bin = _dk_dark_pixel_mask.reshape(h, w).astype(np.uint8)
+            # For light clusters use a larger CLOSE kernel to connect nearby
+            # scattered short segments (e.g. fine botanical ink endpoints) into
+            # blobs large enough to pass the area filter.  Dark cluster boundary
+            # zone uses the smaller kernel to stay faithful to thin features.
+            _dk_close_kern = _morph_ell if _dk_is_dark_cluster else _morph_ell_lg
+            _dk_area_min = 5 if _dk_is_dark_cluster else 3
+            _dk_bin = cv2.morphologyEx(_dk_bin, cv2.MORPH_CLOSE, _dk_close_kern, iterations=2)
+            if not cluster_is_thin[_dk]:
+                _dk_bin = cv2.dilate(_dk_bin, _morph_ell, iterations=1)
+            if cv2.countNonZero(_dk_bin) < 30:
+                continue
+            # Extract contours with CCOMP hierarchy so inner holes (e.g. interior
+            # of looped ink strokes) remain unfilled.  Used with fill-rule="evenodd"
+            # in SVG so nested paths correctly punch holes.
+            _dk_contours, _ = cv2.findContours(_dk_bin, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            if not _dk_contours:
+                continue
+            # Dark fill color from the actual dark pixels in this cluster.
+            # Clamp the fill so its grayscale is strictly below dark_thresh —
+            # the median BGR of pixels with orig_gray < dark_thresh can still
+            # compute above the threshold due to channel-weight differences.
+            _dk_fill = np.median(_dov_bgr_flat[_dk_dark_pixel_mask], axis=0).astype(np.uint8)
+            _dk_fill_gray = int(cv2.cvtColor(_dk_fill.reshape(1, 1, 3), cv2.COLOR_BGR2GRAY)[0, 0])
+            if _dk_fill_gray >= _dov_dt:
+                _dk_scale = float(_dov_dt - 2) / float(max(1, _dk_fill_gray))
+                _dk_fill = np.clip(
+                    np.floor(_dk_fill.astype(np.float32) * _dk_scale).astype(np.int32),
+                    0, 255,
+                ).astype(np.uint8)
+            _dk_hex = _bgr_to_hex(_dk_fill)
+            # Build simplified SVG polygon paths
+            _dk_path_parts: list[str] = []
+            for _cnt in _dk_contours:
+                if len(_cnt) < 3:
+                    continue
+                # Filter scatter-point noise using per-type area threshold.
+                # Light-cluster overlay uses a lower threshold (3) since fine ink
+                # endpoints can be very short.  Dark-cluster boundary zone uses 5.
+                if cv2.contourArea(_cnt) < _dk_area_min:
+                    continue
+                # Cap epsilon at 1.5px regardless of contour length.  The old
+                # 0.3% formula gave 3–6px for long contours, which collapses
+                # thin ink strokes (4px wide) into degenerate near-zero-area
+                # polygons, leaving their pixels uncovered.
+                _eps = max(0.5, min(1.5, cv2.arcLength(_cnt, True) * 0.001))
+                _approx = cv2.approxPolyDP(_cnt, _eps, True).reshape(-1, 2)
+                if len(_approx) < 3:
+                    continue
+                _seg = f"M {_approx[0,0]},{_approx[0,1]}"
+                for _p in _approx[1:]:
+                    _seg += f" L {_p[0]},{_p[1]}"
+                _seg += " Z"
+                _dk_path_parts.append(_seg)
+            if _dk_path_parts:
+                _dark_overlays.append((" ".join(_dk_path_parts), _dk_hex))
+                if _cluster_debug:
+                    _dk_frac = _dk_dark_n / max(1, int(_dk_mask.sum()))
+                    kind = "dark-cluster-bz" if _dk_is_dark_cluster else "light-cluster"
+                    print(f"[CLUSTER] dark-overlay({kind}): k{_dk} rc_gray={_rc_gray} "
+                          f"dark_frac={_dk_frac:.3f} dark_n={_dk_dark_n}")
+
     return MultilevelResult(
         layers=layers,
         stroke_layers=stroke_layers,
@@ -2310,6 +2612,7 @@ def multilevel_vectorize(
         path_count=total_paths,
         node_count=total_nodes,
         gradient_defs=gradient_defs if gradient_defs else None,
+        dark_overlays=_dark_overlays if _dark_overlays else None,
     )
 
 
@@ -2416,6 +2719,15 @@ def generate_svg(
                 f'<path d="{path_d}" fill="none" stroke="{sl.color}"'
                 f' stroke-width="{sw:.2f}"'
                 f' stroke-linecap="round" stroke-linejoin="round"/>'
+            )
+
+    # Dark feature overlays: painted last (top z-order) to correctly render
+    # dark strokes in mixed-luminance clusters whose fill color was too light.
+    if result.dark_overlays:
+        for _ov_path, _ov_hex in result.dark_overlays:
+            parts.append(
+                f'<path d="{_ov_path}" fill="{_ov_hex}"'
+                f' fill-rule="evenodd" shape-rendering="crispEdges"/>'
             )
 
     parts.append("</svg>")
@@ -2638,11 +2950,11 @@ def _detect_gradients(
         if _diag and len(_diag_corr_samples) < 12:
             _diag_corr_samples.append((seed, pix_count, spatial_corr))
         if pix_count >= total_px * 0.03:
-            _min_spatial_corr = 0.30
+            _min_spatial_corr = 0.25
         elif _small_warm_region:
-            _min_spatial_corr = 0.28
+            _min_spatial_corr = 0.25
         else:
-            _min_spatial_corr = 0.65
+            _min_spatial_corr = 0.55
         if not np.isfinite(spatial_corr) or abs(spatial_corr) < _min_spatial_corr:
             _used_alt_axis = False
             if _small_warm_region:
@@ -2687,7 +2999,7 @@ def _detect_gradients(
 
         texture_residual = float(np.std(src_gray[ys_s, xs_s] - src_gray_blur[ys_s, xs_s]))
         _warm_scale = 1.55 if _small_warm_region else (1.35 if _warm_mid_sat else 1.0)
-        _texture_thresh = max(6.5, endpoint_dist * 0.42) * _warm_scale
+        _texture_thresh = max(8.0, endpoint_dist * 0.50) * _warm_scale
         if texture_residual > _texture_thresh:
             _diag_counts["reject_texture"] += 1
             _diag_reject(diag_label, f"texture:{texture_residual:.1f}>{_texture_thresh:.1f}")
@@ -2697,7 +3009,7 @@ def _detect_gradients(
         t_vals = np.clip((proj_spatial - p_min) / spatial_span, 0.0, 1.0)
         color_line = color_start[None, :] + (color_end - color_start)[None, :] * t_vals[:, None]
         fit_residual = float(np.mean(np.linalg.norm(colors - color_line, axis=1)))
-        _fit_thresh = max(12.0, endpoint_dist * 0.30) * _warm_scale
+        _fit_thresh = max(25.0, endpoint_dist * 0.45) * _warm_scale
         if fit_residual > _fit_thresh:
             radial_gd = _try_small_warm_radial_gradient()
             if radial_gd is not None:
@@ -2930,6 +3242,128 @@ def _detect_gradients(
             print("[GRAD] rejected regions " + " | ".join(_diag_reject_regions))
         if _diag_radial_regions:
             print("[GRAD] radial regions " + " | ".join(_diag_radial_regions))
+
+    # --- Multi-cluster gradient chain detection ---
+    # When multiple adjacent clusters each have individual gradients and share
+    # similar warm/chromatic tones (skin, foliage, sky transitions), combining
+    # them into a single unified gradient produces smooth transitions instead of
+    # visible banding at cluster boundaries.
+    if len(single_gradient_regions) >= 2:
+        # LAB cluster centers for color proximity check
+        _clab = cv2.cvtColor(centers_u8, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+        # Build adjacency matrix from labels (O(h*w))
+        _chain_adj = np.zeros((K, K), dtype=np.int32)
+        _hl = labels[:, :-1]
+        _hr = labels[:, 1:]
+        _hb = _hl != _hr
+        _ha1 = np.minimum(_hl[_hb], _hr[_hb])
+        _ha2 = np.maximum(_hl[_hb], _hr[_hb])
+        np.add.at(_chain_adj, (_ha1.ravel(), _ha2.ravel()), 1)
+        _vt = labels[:-1, :]
+        _vb_arr = labels[1:, :]
+        _vbord = _vt != _vb_arr
+        _va1 = np.minimum(_vt[_vbord], _vb_arr[_vbord])
+        _va2 = np.maximum(_vt[_vbord], _vb_arr[_vbord])
+        np.add.at(_chain_adj, (_va1.ravel(), _va2.ravel()), 1)
+        _chain_min_adj = max(20, int(h * w * 0.00015))
+        _CHAIN_LAB_DIST = 42.0
+
+        # Union-Find for connected gradient chain components
+        _uf: list[int] = list(range(K))
+
+        def _uf_find(x: int) -> int:
+            while _uf[x] != x:
+                _uf[x] = _uf[_uf[x]]
+                x = _uf[x]
+            return x
+
+        def _uf_union(a: int, b: int) -> None:
+            ra, rb = _uf_find(a), _uf_find(b)
+            if ra != rb:
+                _uf[ra] = rb
+
+        # Only chain clusters that BOTH have individual gradient detections.
+        # Restricting _ck2 to the same set prevents achromatic "bridge" clusters
+        # (e.g. small rejected regions) from creating spurious mega-chains.
+        _chain_dbg: list[str] = []
+        _sgr_keys = list(single_gradient_regions.keys())
+        for _ck1 in _sgr_keys:
+            _sat1 = int(centers_hsv[_ck1, 1])
+            _hue1 = int(centers_hsv[_ck1, 0])
+            for _ck2 in _sgr_keys:
+                if _ck2 == _ck1 or _ck2 == bg_cluster:
+                    continue
+                _sat2 = int(centers_hsv[_ck2, 1])
+                # Skip achromatic↔chromatic pairs to avoid bg contamination
+                if (_sat1 < 10) != (_sat2 < 10):
+                    continue
+                # Color proximity in LAB
+                _lab_d = float(np.linalg.norm(_clab[_ck1] - _clab[_ck2]))
+                if _lab_d > _CHAIN_LAB_DIST:
+                    if _diag:
+                        _chain_dbg.append(f"{_ck1},{_ck2}:lab>{_lab_d:.1f}")
+                    continue
+                # Hue compatibility for chromatic clusters
+                _hue2 = int(centers_hsv[_ck2, 0])
+                if _sat1 > 25 and _sat2 > 25:
+                    _hd = abs(_hue1 - _hue2)
+                    _hd = min(_hd, 180 - _hd)
+                    if _hd > 30:
+                        if _diag:
+                            _chain_dbg.append(f"{_ck1},{_ck2}:hue>{_hd}")
+                        continue
+                # Spatial adjacency
+                _ca1, _ca2 = min(_ck1, _ck2), max(_ck1, _ck2)
+                _adj_count = int(_chain_adj[_ca1, _ca2])
+                if _adj_count < _chain_min_adj:
+                    if _diag:
+                        _chain_dbg.append(f"{_ck1},{_ck2}:adj={_adj_count}<{_chain_min_adj}")
+                    continue
+                if _diag:
+                    _chain_dbg.append(f"{_ck1},{_ck2}:UNION(adj={_adj_count})")
+                _uf_union(_ck1, _ck2)
+        if _diag and _chain_dbg:
+            print("[CHAIN_DBG] " + " | ".join(_chain_dbg[:30]))
+
+        # Collect groups
+        _cgroups: dict[int, list[int]] = {}
+        for _ck in range(K):
+            if _ck == bg_cluster:
+                continue
+            _cgroups.setdefault(_uf_find(_ck), []).append(_ck)
+
+        _chain_accept: list[str] = []
+        for _cgroot, _cgmembers in _cgroups.items():
+            if len(_cgmembers) < 2:
+                continue
+            # Require at least one member to have an existing individual gradient
+            if not any(_m in single_gradient_regions for _m in _cgmembers):
+                continue
+            # Combine masks of all clusters in the group
+            _chain_mask = np.zeros((h, w), dtype=bool)
+            for _m in _cgmembers:
+                _chain_mask |= (labels == _m)
+            # Fit gradient on combined region; allow smaller min_region_pct
+            _cgd = _fit_gradient_region(
+                _chain_mask, seed=_cgroot,
+                min_region_pct_override=0.4,
+                diag_label=f"chain:{sorted(_cgmembers)}",
+            )
+            if _cgd is None:
+                _chain_key = f"chain:{sorted(_cgmembers)}"
+                _chain_why = [r for r in _diag_reject_regions if _chain_key in r]
+                if _diag:
+                    print(f"[CHAIN_REJECT] {_chain_key} → {_chain_why}")
+                continue
+            gradient_defs.append(_cgd)
+            _chain_fill = f"url(#{_cgd.id})"
+            for _m in _cgmembers:
+                single_gradient_regions.pop(_m, None)
+                gradient_fill_map[_m] = _chain_fill
+            _chain_accept.append(f"chain:{sorted(_cgmembers)}:{_cgd.kind}")
+
+        if _diag and _chain_accept:
+            print("[GRAD] chains " + " | ".join(_chain_accept))
 
 
 def _gradient_aware_merge(

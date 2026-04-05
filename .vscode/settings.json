@@ -9,5 +9,7 @@
     "python generate.py *",
     "python _inspect_closeup.py *",
     "source raster-to-vector/server/.venv/bin/activate"
-  ]
+  ],
+  "editor.formatOnSave": false,
+  "editor.codeActionsOnSave": {}
 }

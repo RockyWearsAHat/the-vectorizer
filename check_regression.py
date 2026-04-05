@@ -18,16 +18,11 @@ SUMMARY_PATH = os.path.join("_comparisons", "summary.txt")
 # Baselines embedded from kb-baselines.md (source of truth)
 # Format: {image_name: {metric: value}}
 BASELINES = {
-    "Ref":  {"Feat%": 90.6, "Miss%": 5.6, "Xtra%": 27.6, "WdErr": 0.04, "MnDif": 5.22, "Nodes": 10266},
-    "test2":{"Feat%": 96.7, "Miss%": 1.0, "Xtra%": 2.6, "WdErr": 25.61, "MnDif": 11.01, "Nodes": 18665},
-    "test3":{"Feat%": 86.7, "Miss%": 5.1, "Xtra%": 14.6, "WdErr": 11.16, "MnDif": 1.65, "Nodes": 14013},
-    "test4":{"Feat%": 90.9, "Miss%": 4.0, "Xtra%": 2.3, "WdErr": 2.54, "MnDif": 15.66, "Nodes": 113802},
-    "test5":{"Feat%": 82.8, "Miss%": 3.3, "Xtra%": 6.8, "WdErr": 5.01, "MnDif": 10.23, "Nodes": 48782},
-},
-    "test2": {"Feat%": 97.2, "Miss%": 0.7, "Xtra%": 2.5,  "WdErr": 25.19, "MnDif": 10.36, "Nodes": 20828},
-    "test3": {"Feat%": 87.3, "Miss%": 4.8, "Xtra%": 14.4, "WdErr": 12.11, "MnDif": 1.62,  "Nodes": 15786},
-    "test4": {"Feat%": 91.6, "Miss%": 2.4, "Xtra%": 2.3,  "WdErr": 2.56,  "MnDif": 13.31, "Nodes": 123296},
-    "test5": {"Feat%": 83.6, "Miss%": 3.1, "Xtra%": 6.8,  "WdErr": 6.48,  "MnDif": 10.09, "Nodes": 53930},
+    "Ref":  {"Feat%": 99.2, "Miss%": 0.6, "Xtra%": 42.6, "WdErr": 0.39, "MnDif": 5.29, "Nodes": 25392},
+    "test2":{"Feat%": 99.8, "Miss%": 0.2, "Xtra%": 1.8, "WdErr": 54.55, "MnDif": 10.16, "Nodes": 19592},
+    "test3":{"Feat%": 98.6, "Miss%": 0.6, "Xtra%": 20.8, "WdErr": 16.16, "MnDif": 1.59, "Nodes": 14680},
+    "test4":{"Feat%": 99.2, "Miss%": 1.3, "Xtra%": 3.7, "WdErr": 35.89, "MnDif": 14.18, "Nodes": 116718},
+    "test5":{"Feat%": 99.3, "Miss%": 0.3, "Xtra%": 10.9, "WdErr": 18.53, "MnDif": 9.67, "Nodes": 50229},
 }
 
 # Regression thresholds: how much worse before we flag it

@@ -74,6 +74,12 @@ Each entry: what was tried → what happened → why it failed.
 - **Edge-aware iso tightening (factor 0.12)** on large images → helps WdErr but hurts Feature% by 1-2pp across the board. Too aggressive.
 - **Resolution-based iso adjustment** (lower iso for higher-res) → inconsistent, couples too many images together.
 
+## Mixed-luminance cluster splitting dead ends
+
+- **K=2 K-means sub-split for mixed-luminance clusters** (2026): For clusters with `dark_frac ∈ [0.04, 0.80]` and `render_center_gray > dark_thresh`, split the cluster's pixels into K=2 sub-clusters (dark half + light half), add both sub-centroids to the main centroid list, rerun soft-field. CATASTROPHIC REGRESSION: test3 Feat% 86.7→69.9 (-16.8pp!), test2 96.7→94.1. Root cause: **centroid competition**. Adding the new dark sub-centroid to the soft-field distance computation makes it become the `d_other` reference for EXISTING adjacent dark clusters. For test3, the new sub-centroid (gray≈80) fell between existing dark clusters k1 (gray≈57) and k5 (gray≈42) in LAB space → their `d_other` distance shrank dramatically → `soft_sq = d_other²/(d_k²+d_other²)` dropped below `iso_sq` ≈ 0.344 → those dark clusters LOST coverage. **Any approach that adds new centroids to soft-field computation will have this problem. The fix must leave centroids UNCHANGED. The dark overlay approach (post-process dark paths on top) solves this correctly.**
+
+- **Hard luminance threshold split** (splitting a cluster by `gray < dark_thresh` vs `gray ≥ dark_thresh` without K-means): Same fundamental problem — new centroid still enters soft-field computation and steals `d_other` from adjacent dark clusters.
+
 ## Abutting / overlap removal dead ends
 
 - **Naive partition map (pixel → cluster with highest soft membership)** → Used to clip per-cluster binary masks (remove pixels claimed by other clusters). Caused MASSIVE regressions: test4 Feat% 90.9→79.7, test2 85→88→back, test5 86→78. Root cause: the painter's algorithm RELIES on soft-field overlap for seamless rendering. Removing overlap creates gap slivers and undercuts feature coverage. An abutting approach requires fundamentally different SVG construction (abutting path edges, not clipped painter's layers).
