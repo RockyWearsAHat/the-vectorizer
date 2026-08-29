@@ -1,0 +1,18 @@
+# the-vectorizer
+
+High-quality raster-to-vector conversion: turn raster images (PNG, JPG, WebP) into clean SVG vector graphics with sub-pixel accuracy. The project combines K-means clustering, soft membership fields, adaptive iso-thresholding, and Bézier curve fitting to produce crisp line art and text from scanned pages, photographs, and artwork. Complete and live means: the core engine is stable, the web demo on GitHub Pages handles common image types without regression, comparison metrics show consistent quality gains, and vectorization parameters can be tuned by end users through presets.
+
+## Now
+
+- [ ] Implement the Potrace optimal-polygon optimization pass to reduce path complexity after initial Bézier fitting (measure: path node count reduction, runtime improvement)
+- [ ] Add user-tunable vectorization parameters (tightness, corners, noise, color count) with named presets (tight/balanced/loose) exposed in the GitHub Pages demo
+- [ ] Build an interactive SSIM/MAE comparison dashboard over the test image suite to visualize quality gains and regressions across algorithm changes
+
+## Policy
+
+- model: haiku
+- slots: 2
+- escalateOnRetry: true
+- scout: true
+- push: origin/main
+- url: https://rockywearsahat.github.io/the-vectorizer/
