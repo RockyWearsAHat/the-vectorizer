@@ -1,16 +1,23 @@
 """Batch vectorize all test images and produce side-by-side comparison PNGs.
 
-Generates:
-  _comparisons/{name}_comparison.png  — original | SVG render | error map
-  _comparisons/{name}_output.svg      — the SVG
-  _comparisons/{name}_metrics.txt     — structural metrics
-  _comparisons/summary.txt            — aggregate table
+On each run, old output files are archived to _comparisons/old_runs/{timestamp}/
+(use --no-archive to delete instead). The directory is always fresh for the current run.
+
+Generates per image:
+  _comparisons/{name}_comparison.png         — original | SVG render | error map
+  _comparisons/{name}_output.svg             — the SVG
+  _comparisons/{name}_metrics.txt            — structural metrics
+  _comparisons/{name}_sidebyside_center.png  — center crop: original | SVG
+  _comparisons/{name}_sidebyside_topleft.png — top-left crop: original | SVG
+  _comparisons/summary.txt                   — aggregate table
 """
-import sys, os, time, glob, argparse
+import sys, os, time, glob, argparse, shutil
+from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "raster-to-vector", "server"))
 import cv2
 import numpy as np
 import cairosvg
+from PIL import Image
 from scipy.ndimage import distance_transform_edt
 from skimage.morphology import skeletonize
 from app.core.multilevel import multilevel_vectorize, generate_svg, optimize_svg_colors
@@ -30,6 +37,16 @@ parser.add_argument(
     action="store_true",
     help="Run optimize_svg_colors even without --full; useful for targeted comparisons",
 )
+parser.add_argument(
+    "--no-archive",
+    action="store_true",
+    help="Delete old output files instead of archiving to old_runs/",
+)
+parser.add_argument(
+    "--no-crops",
+    action="store_true",
+    help="Skip side-by-side crop images (faster iteration)",
+)
 args = parser.parse_args()
 
 if args.full:
@@ -41,7 +58,9 @@ FAST_MODE = args.fast
 RUN_COLOR_OPTIMIZATION = True
 
 OUT_DIR = "_comparisons"
+OLD_RUNS_DIR = os.path.join(OUT_DIR, "old_runs")
 os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(OLD_RUNS_DIR, exist_ok=True)
 
 # Collect test images
 IMAGE_FILES = sorted(glob.glob("Ref.png") + glob.glob("test[0-9]*.jpg") + glob.glob("test[0-9]*.png"))
@@ -88,6 +107,60 @@ if RUN_COLOR_OPTIMIZATION and not args.full:
     print("Color optimization forced for this run")
 
 print(f"Found {len(IMAGE_FILES)} images: {', '.join(IMAGE_FILES)}")
+
+
+# ─── Archive / clear stale outputs before this run ────────────────────────────
+
+def _archive_outputs(out_dir, old_runs_dir, delete=False, name_prefixes=None):
+    """Move or delete stale output files. name_prefixes limits to specific images."""
+    all_files = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
+    if name_prefixes:
+        targets = [f for f in all_files if any(f.startswith(p) for p in name_prefixes) or f == "summary.txt"]
+    else:
+        targets = all_files
+    if not targets:
+        return
+    if delete:
+        for f in targets:
+            os.remove(os.path.join(out_dir, f))
+        print(f"Cleared {len(targets)} old output files.")
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_dir = os.path.join(old_runs_dir, ts)
+        os.makedirs(archive_dir, exist_ok=True)
+        for f in targets:
+            shutil.move(os.path.join(out_dir, f), os.path.join(archive_dir, f))
+        print(f"Archived {len(targets)} files → {archive_dir}/")
+
+if args.images:
+    name_prefixes = [os.path.splitext(os.path.basename(f))[0] for f in IMAGE_FILES]
+    _archive_outputs(OUT_DIR, OLD_RUNS_DIR, delete=args.no_archive, name_prefixes=name_prefixes)
+else:
+    _archive_outputs(OUT_DIR, OLD_RUNS_DIR, delete=args.no_archive)
+
+
+# ─── Side-by-side crop helper ─────────────────────────────────────────────────
+
+def save_crops(ref_bgr, svg_bgr, name, out_dir):
+    """Save original|SVG side-by-side crops for center and top-left regions."""
+    h, w = ref_bgr.shape[:2]
+    ref_pil = Image.fromarray(cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB))
+    svg_pil = Image.fromarray(cv2.cvtColor(svg_bgr, cv2.COLOR_BGR2RGB))
+
+    cx, cy = w // 2, h // 2
+    crop_w, crop_h = w // 4, h // 4
+    tl_w, tl_h = w // 3, h // 3
+
+    regions = {
+        "center":  (cx - crop_w // 2, cy - crop_h // 2, cx + crop_w // 2, cy + crop_h // 2),
+        "topleft": (0, 0, tl_w, tl_h),
+    }
+    for region_name, box in regions.items():
+        rw, rh = box[2] - box[0], box[3] - box[1]
+        combined = Image.new("RGB", (rw * 2 + 4, rh), (128, 128, 128))
+        combined.paste(ref_pil.crop(box), (0, 0))
+        combined.paste(svg_pil.crop(box), (rw + 4, 0))
+        combined.save(os.path.join(out_dir, f"{name}_sidebyside_{region_name}.png"))
 
 
 def structural_metrics(ref_gray, svg_gray, dark_thresh=None):
@@ -249,6 +322,10 @@ for img_path in IMAGE_FILES:
     comp = make_comparison_image(ref, svg_img, name)
     comp_path = os.path.join(OUT_DIR, f"{name}_comparison.png")
     cv2.imwrite(comp_path, comp)
+
+    # Side-by-side crops for visual inspection
+    if not args.no_crops:
+        save_crops(ref, svg_img, name, OUT_DIR)
 
     # Metrics file
     met_path = os.path.join(OUT_DIR, f"{name}_metrics.txt")

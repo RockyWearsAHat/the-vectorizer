@@ -108,10 +108,12 @@ class MultilevelResult:
 def detect_background(image_bgr: np.ndarray) -> tuple[np.ndarray, int]:
     """Return (BGR colour, gray value) of the dominant border colour.
 
-    Samples a 5-pixel-wide border strip and uses the mean of all
-    non-ink pixels (gray > 128).  The mean captures subtle warm tones
-    in the background that the median misses, while the ink filter
-    prevents dark artwork on the border from pulling the result too dark.
+    Samples a 5-pixel-wide border strip and uses the majority-brightness
+    half of border pixels to define the background colour.  If more than
+    half the border is light, filter to light pixels (avoids dark ink on
+    a white-paper border).  If more than half the border is dark, filter
+    to dark pixels (avoids a light foreground object touching the border
+    incorrectly overriding a dark-stage/black background).
     """
     h, w = image_bgr.shape[:2]
     bw = min(5, max(1, h // 8), max(1, w // 8))  # border width in px
@@ -121,16 +123,18 @@ def detect_background(image_bgr: np.ndarray) -> tuple[np.ndarray, int]:
         image_bgr[bw:-bw, :bw].reshape(-1, 3),
         image_bgr[bw:-bw, -bw:].reshape(-1, 3),
     ])
-    # Filter out clearly dark pixels (ink/artwork touching the border)
     gray_vals = (0.299 * border[:, 2] + 0.587 * border[:, 1]
                  + 0.114 * border[:, 0])
     light_mask = gray_vals > 128
-    if light_mask.sum() > 10:
-        light_border = border[light_mask]
+    light_frac = float(light_mask.mean())
+    if light_frac >= 0.5:
+        # Light-dominant border → background is light (e.g. white paper, light wall)
+        selected = border[light_mask] if light_mask.sum() > 10 else border
     else:
-        light_border = border  # fallback: use all
-    # Mean preserves warm tones better than median for near-white backgrounds
-    color = light_border.mean(axis=0).astype(np.uint8)
+        # Dark-dominant border → background IS dark (e.g. dark stage, black bg)
+        dark_mask = ~light_mask
+        selected = border[dark_mask] if dark_mask.sum() > 10 else border
+    color = selected.mean(axis=0).astype(np.uint8)
     gray = int(cv2.cvtColor(color.reshape(1, 1, 3), cv2.COLOR_BGR2GRAY)[0, 0])
     return color, gray
 
@@ -824,7 +828,7 @@ def multilevel_vectorize(
     max_error: float = 1.5,
     line_tolerance: float = 0.5,
     corner_threshold: float = 55.0,
-    min_contour_area: int = 6,
+    min_contour_area: int = 3,
     contour_scale: int = 4,
     smooth_sigma: float = 0.50,
     mediator_threshold: float = 0.3,   # backward compat (used in absorption)
@@ -909,16 +913,16 @@ def multilevel_vectorize(
         _red_frac = 0.0
     _enable_warm_fill_relax = _sat_frac > 0.25 and _warm_yellow_frac > 0.72 and _red_frac < 0.12
     _has_color = _mean_sat > 15 or _sat_frac > 0.01
-    # Dynamic max_k: match documented tiers that gave best quality.
-    # Color distinction removed — extra clusters fragment features more than
-    # they help color fidelity (test4 regressed 96.5% → 83% with K=10 vs K=7).
+    # Large images regress hard when K is allowed to balloon: fragmentation
+    # explodes node count, width error, and runtime. Keep K within the
+    # validated size caps and let the merge stages clean up the rest.
     if h * w > 16_000_000:
-        _max_k = 10
+        _max_k_cap = 10
     elif h * w > 4_000_000:
-        _max_k = 12
+        _max_k_cap = 20 if _sat_frac > 0.70 and _mean_sat > 60.0 and not _enable_warm_fill_relax else 16
     else:
-        _max_k = 20
-    K = _estimate_initial_k(image_bgr, max_k=_max_k) if num_levels <= 0 else max(2, min(num_levels, 64))
+        _max_k_cap = 24
+    K = _estimate_initial_k(image_bgr, max_k=_max_k_cap) if num_levels <= 0 else max(2, min(num_levels, 64))
     # No fitting tolerance scaling — keep configured values to preserve width accuracy
     _km_iters = 10
     _km_attempts = 10
@@ -993,8 +997,19 @@ def multilevel_vectorize(
     centers_f = centers.astype(np.float32)
 
     # --- Step 1c: Identify background cluster ---
-    # Only skip if the nearest cluster is genuinely close to the
-    # detected border colour (distance < 40 in BGR space).
+    # Require the bg cluster to be the *dominant label* at the actual border
+    # pixels (>35% of border pixels assigned to it) AND close to bg_color.
+    # This prevents complex photographic scenes (where border pixels are diverse
+    # and no single cluster dominates) from incorrectly skipping an interior
+    # color cluster that merely happens to average close to the border mean.
+    _bw = min(5, max(1, h // 8), max(1, w // 8))
+    _labels_2d = labels.reshape(h, w)
+    _border_mask = np.zeros((h, w), dtype=bool)
+    _border_mask[:_bw, :] = True
+    _border_mask[-_bw:, :] = True
+    _border_mask[:, :_bw] = True
+    _border_mask[:, -_bw:] = True
+    _border_labels = _labels_2d[_border_mask]
     bg_dists = np.array([
         np.linalg.norm(centers_f[k] - bg_color.astype(np.float32))
         for k in range(K)
@@ -1010,8 +1025,6 @@ def multilevel_vectorize(
                 f" hsv=({int(_premerge_hsv[k,0])},{int(_premerge_hsv[k,1])},{int(_premerge_hsv[k,2])})"
                 f" px={int(np.count_nonzero(labels == k))}"
             )
-        print(f"[CLUSTER] bg_color=({int(bg_color[0])},{int(bg_color[1])},{int(bg_color[2])}) bg_cluster={bg_cluster}")
-        print("[CLUSTER] centers_pre " + " | ".join(_parts[:16]))
 
     # --- Step 1d: Gradient-aware merge ---
     # Collapse cluster pairs whose boundary has low color contrast
@@ -1032,8 +1045,6 @@ def multilevel_vectorize(
                 f" hsv=({int(_post_hsv[k,0])},{int(_post_hsv[k,1])},{int(_post_hsv[k,2])})"
                 f" px={int(np.count_nonzero(labels == k))}"
             )
-        print(f"[CLUSTER] post_merge bg_cluster={bg_cluster}")
-        print("[CLUSTER] centers_post " + " | ".join(_parts[:16]))
     _t_merge = time.time()
 
     centers_u = centers_f.astype(np.uint8)
@@ -1112,13 +1123,15 @@ def multilevel_vectorize(
     centers_f, labels = _area_merge_clusters(centers_f, labels, lambda_=_area_merge_lambda)
     K = len(centers_f)
     centers_u = centers_f.astype(np.uint8)
-    # Re-identify bg cluster after merge
+    # Re-identify bg cluster after merge — use the same border-coverage
+    # criterion as Step 1c to stay consistent.
     if K > 0:
         _bg_dists_post = np.array([
             np.linalg.norm(centers_f[k] - bg_color.astype(np.float32))
             for k in range(K)
         ])
-        bg_cluster = int(np.argmin(_bg_dists_post)) if _bg_dists_post.min() < 40.0 else -1
+        bg_cluster_post_idx = int(np.argmin(_bg_dists_post))
+        bg_cluster = bg_cluster_post_idx if _bg_dists_post[bg_cluster_post_idx] < 40.0 else -1
 
     # Spatial fragment cleanup: absorb small disconnected label fragments into
     # their dominant neighbors.  K-means assigns pixels by color alone, so
@@ -1335,7 +1348,6 @@ def multilevel_vectorize(
                 f"k{k}:hsv=({int(centers_hsv_render[k,0])},{int(centers_hsv_render[k,1])},{int(centers_hsv_render[k,2])}) "
                 f"bgr=({int(centers_u[k,0])},{int(centers_u[k,1])},{int(centers_u[k,2])}) px={int(np.count_nonzero(labels == k))}"
             )
-        print("[WARM] clusters " + " | ".join(debug_parts[:12]))
         for k in warm_debug_clusters:
             mask_k = labels == k
             if not np.any(mask_k):
@@ -1361,7 +1373,7 @@ def multilevel_vectorize(
                 for idx in top if competitor_hist[idx] > 0
             )
             if top_desc:
-                print(f"[WARM] cluster k{k} nearest competitors {top_desc}")
+                pass  # debug output suppressed; top_desc built above for future use
 
     # --- Step 3e: Classify clusters as thin-feature vs fill ---
     # Thin clusters (text, lines, serifs) need higher iso to avoid
@@ -1412,17 +1424,36 @@ def multilevel_vectorize(
     # rendered clusters.  Simple images (few K) get high S; complex
     # images (many K) trade S for color fidelity.
     K_render = max(1, K - 1 if bg_cluster >= 0 else K)
-    _TOTAL_BUDGET = 2_000_000_000
-    # Adaptive min S: higher S = smoother contour edges.
-    _min_S = 2 if h * w > 8_000_000 else (2 if h * w > 4_000_000 else 3)
-    _max_S = 4 if h * w > 4_000_000 else contour_scale
+    _TOTAL_BUDGET = 500_000_000
+    # Large photographic images need stricter S caps. Oversuperresolution
+    # makes boundaries too fat and explodes path count.
+    if h * w > 30_000_000:
+        _min_S = 1
+        _max_S = min(contour_scale, 3)
+    elif h * w > 16_000_000:
+        _min_S = 1
+        _max_S = min(contour_scale, 2)
+    elif h * w > 8_000_000:
+        _min_S = 2
+        _max_S = min(contour_scale, 2)
+    elif h * w > 4_000_000:
+        _min_S = 2
+        _max_S = min(contour_scale, 2)
+    else:
+        _min_S = 3
+        _max_S = contour_scale
     _s_target = math.sqrt(_TOTAL_BUDGET / max(h * w * K_render, 1))
     if h * w > 16_000_000:
         _s_choice = int(round(_s_target))
     else:
         _s_choice = int(_s_target)
     S = max(_min_S, min(_max_S, _s_choice))
-    print(f"[DIAG] {w}x{h} K_initial={K} K_final={K_render} S={S}")
+    _large_image_fastpath = h * w > 4_000_000
+    _large_upscaled = h * w * S * S > 32_000_000
+    edge_weight_up_shared = cv2.resize(
+        edge_weight, (w * S, h * S), interpolation=cv2.INTER_LINEAR,
+    )
+    np.clip(edge_weight_up_shared, 0.0, 1.0, out=edge_weight_up_shared)
 
     _t_preprocess = time.time()
     _t_curves_total = 0.0
@@ -1636,14 +1667,6 @@ def multilevel_vectorize(
         soft_raw = d_other / denom
         _t_soft = time.time()
 
-        hard_edge_conf = _compute_hard_edge_confidence(
-            source_lab,
-            soft_raw,
-            d_k,
-            d_other,
-            lab_grad_mag=source_lab_grad,
-        )
-
         # --- Superresolution contour extraction ---
         # Blur at native resolution first (much cheaper than blurring
         # the upscaled image) then upscale with cubic interpolation.
@@ -1651,6 +1674,13 @@ def multilevel_vectorize(
         sigma_smooth_nat = max(0.66 - mediator * 0.30, 0.30)
         crisp_nat = cv2.GaussianBlur(soft_raw, (0, 0), sigmaX=sigma_crisp_nat)
         smooth_nat = cv2.GaussianBlur(soft_raw, (0, 0), sigmaX=sigma_smooth_nat)
+        hard_edge_conf = _compute_hard_edge_confidence(
+            source_lab,
+            soft_raw,
+            d_k,
+            d_other,
+            lab_grad_mag=source_lab_grad,
+        )
         edge_locked_conf = hard_edge_conf * np.clip(edge_weight + 0.15, 0.0, 1.0)
         smooth_protection = edge_locked_conf * 0.03
         protected_smooth = smooth_nat * (1.0 - smooth_protection) + soft_raw * smooth_protection
@@ -1659,12 +1689,10 @@ def multilevel_vectorize(
                              interpolation=cv2.INTER_LINEAR)
         hard_edge_up = cv2.resize(hard_edge_conf, (w * S, h * S),
                       interpolation=cv2.INTER_LINEAR)
-        edge_weight_up = cv2.resize(edge_weight, (w * S, h * S),
-                        interpolation=cv2.INTER_LINEAR)
+        edge_weight_up = edge_weight_up_shared
         # Clamp to [0,1] — cubic interpolation can overshoot.
         np.clip(soft_up, 0.0, 1.0, out=soft_up)
         np.clip(hard_edge_up, 0.0, 1.0, out=hard_edge_up)
-        np.clip(edge_weight_up, 0.0, 1.0, out=edge_weight_up)
         soft = soft_up
 
         # Adaptive iso: thin features use higher iso to shrink
@@ -1819,12 +1847,21 @@ def multilevel_vectorize(
         if _texture_rich_cluster:
             MAX_GROUPS += 250
         if cluster_is_thin[cluster_idx] and _cluster_area_frac >= 0.003:
-            MAX_GROUPS += 150
-        MAX_GROUPS = min(2200, MAX_GROUPS)
+            MAX_GROUPS += 600
+        if _large_upscaled:
+            MAX_GROUPS = min(MAX_GROUPS, 800)
+        MAX_GROUPS = min(3000, MAX_GROUPS)
         if len(_contour_groups) > MAX_GROUPS:
             _raw_areas = [abs(cv2.contourArea(_cv_contours[g[0]])) / (S * S)
                           for g in _contour_groups]
-            _keep_idx = np.argsort(_raw_areas)[::-1][:MAX_GROUPS]
+            if cluster_is_thin[cluster_idx]:
+                # Preserve elongated thin shapes (ink strokes) — score by area * elongation^0.4
+                _raw_perims = [cv2.arcLength(_cv_contours[g[0]], True) / S for g in _contour_groups]
+                _scores = [a * (((p * p) / (a + 1)) ** 0.4) if a > 0 else 0
+                           for a, p in zip(_raw_areas, _raw_perims)]
+                _keep_idx = np.argsort(_scores)[::-1][:MAX_GROUPS]
+            else:
+                _keep_idx = np.argsort(_raw_areas)[::-1][:MAX_GROUPS]
             _contour_groups = [_contour_groups[i] for i in _keep_idx]
 
         # Convert contour groups to xy arrays, fit Béziers, build paths
@@ -1834,7 +1871,7 @@ def multilevel_vectorize(
         total_group_area: list[float] = []
         _t_cluster_fit_start = time.time()
         _fit_budget_exceeded = False
-        _FIT_BUDGET = min(5.0, 20.0 / max(K_render, 1))  # dynamic: K=4→5s, K=8→2.5s
+        _FIT_BUDGET = 4.0 if _large_image_fastpath else min(5.0, 20.0 / max(K_render, 1))
         for group in _contour_groups:
             # Check time budget at group level too
             if time.time() - _t_cluster_fit_start > _FIT_BUDGET:
@@ -1876,6 +1913,7 @@ def multilevel_vectorize(
                     continue
 
                 xy = pts.copy()
+                xy = _collapse_staircase_runs_closed(xy)
                 perim = float(np.sum(np.sqrt(np.sum(np.diff(xy, axis=0)**2, axis=1))))
                 raw_area = abs(_polygon_area(xy))
 
@@ -1896,6 +1934,13 @@ def multilevel_vectorize(
                     # are almost always noise artifacts / texture fragments.
                     _compact_4pi = (4.0 * 3.14159265 * _area_real) / (perim_c * perim_c + 1e-9)
                     if _area_real < 100 and _compact_4pi < 0.10 and elong_c < 50:
+                        continue
+                    # Compact noise blob filter: tiny near-circular shapes are
+                    # JPEG compression artifacts. Real thin strokes have high
+                    # elongation (elong_c >> 20), so the elongation check alone
+                    # distinguishes them from round/square noise blobs.
+                    # Threshold 80 catches JPEG 8x8 blocks (~64 real px at 4x super-res).
+                    if _area_real < 80 and _compact_4pi > 0.35 and elong_c < 20:
                         continue
 
                 width_est = (raw_area / perim) if perim > 1e-6 else 0.0
@@ -2044,7 +2089,7 @@ def multilevel_vectorize(
             return score, region.fill_ref
 
         def _compute_group_fill_hex(group: list[int], group_area: float) -> str:
-            if _sat_frac <= 0.25 or cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.001:
+            if cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.0001:
                 return color_hex
 
             native_contours: list[np.ndarray] = []
@@ -2082,16 +2127,43 @@ def multilevel_vectorize(
 
             roi_cluster = labels[y0:y1 + 1, x0:x1 + 1] == cluster_idx
             sample_mask = (roi_mask > 0) & roi_cluster
-            if int(np.count_nonzero(sample_mask)) < 64:
+            if int(np.count_nonzero(sample_mask)) < 20:
                 return color_hex
 
             samples = image_bgr[y0:y1 + 1, x0:x1 + 1][sample_mask].astype(np.float32)
-            group_color = _render_color_from_samples(samples, render_centers_u[cluster_idx].astype(np.float32))
+            base_color = render_centers_u[cluster_idx].astype(np.float32)
+            group_color = _render_color_from_samples(samples, base_color)
+            if group_area >= total_pixels * 0.002:
+                gray_samples = (
+                    0.114 * samples[:, 0]
+                    + 0.587 * samples[:, 1]
+                    + 0.299 * samples[:, 2]
+                )
+                gray_span = float(np.percentile(gray_samples, 90) - np.percentile(gray_samples, 10))
+                base_gray = float(
+                    0.114 * base_color[0] + 0.587 * base_color[1] + 0.299 * base_color[2]
+                )
+                group_gray = float(
+                    0.114 * group_color[0] + 0.587 * group_color[1] + 0.299 * group_color[2]
+                )
+                if gray_span > 24.0 and base_gray > 80.0 and group_gray < base_gray - 8.0:
+                    target_gray = max(base_gray - 8.0, float(np.percentile(gray_samples, 55)))
+                    if group_gray > 1e-3:
+                        group_color = np.clip(group_color * (target_gray / group_gray), 0, 255)
+                    group_color = 0.75 * group_color + 0.25 * base_color
             return _bgr_to_hex(np.clip(np.round(group_color), 0, 255).astype(np.uint8))
 
         def _try_group_gradient_fill(group: list[int], group_area: float) -> str | None:
-            if _sat_frac <= 0.25 or cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.004:
+            # Achromatic clusters (gray paint reflections on white cars) need
+            # gradient fills even when the group is smaller or the color spread
+            # is more subtle.  Relax both gates for near-grey regions.
+            _csat_grad = int(centers_hsv_render[cluster_idx, 1])
+            _is_achromatic_grad = _csat_grad < 25
+            _is_large_group = group_area > total_pixels * 0.015
+            _area_thresh_grad = total_pixels * (0.0015 if _is_achromatic_grad else 0.004)
+            if cluster_is_thin[cluster_idx] or group_area < _area_thresh_grad:
                 return None
+            _dbg_grad = False
 
             native_contours: list[np.ndarray] = []
             x0 = w
@@ -2147,7 +2219,10 @@ def multilevel_vectorize(
 
             principal_idx = int(np.argmax(eigenvalues))
             spread = float(np.sqrt(eigenvalues[principal_idx]))
-            if spread < 10.0 or spread > 120.0:
+            _min_spread = 3.0 if _is_achromatic_grad else 10.0
+            if spread < _min_spread or spread > 120.0:
+                if _dbg_grad:
+                    pass
                 return None
 
             projections = centered @ eigenvectors[:, principal_idx]
@@ -2164,14 +2239,26 @@ def multilevel_vectorize(
             proj_spatial = coords_c @ grad_dir
             p_min = float(proj_spatial.min())
             p_max = float(proj_spatial.max())
-            if p_max - p_min < 40.0:
+            _span_thresh = 20.0 if _is_achromatic_grad else 40.0
+            if p_max - p_min < _span_thresh:
+                if _dbg_grad:
+                    pass
                 return None
 
             try:
                 spatial_corr = float(np.corrcoef(proj_spatial, projections)[0, 1])
             except Exception:
                 return None
-            if not np.isfinite(spatial_corr) or abs(spatial_corr) < 0.35:
+            # Large groups have more complex spatial color structure (arch shadows,
+            # sky gradients, skin tones) — they rarely fail due to truly random
+            # color but often fail due to slightly non-linear gradient. Relax.
+            if _is_large_group and not _is_achromatic_grad:
+                _corr_thresh = 0.25
+            else:
+                _corr_thresh = 0.20 if _is_achromatic_grad else 0.35
+            if not np.isfinite(spatial_corr) or abs(spatial_corr) < _corr_thresh:
+                if _dbg_grad:
+                    pass
                 return None
 
             low_mask = proj_spatial < np.percentile(proj_spatial, 10)
@@ -2182,15 +2269,23 @@ def multilevel_vectorize(
             color_start = colors[low_mask].mean(axis=0)
             color_end = colors[high_mask].mean(axis=0)
             endpoint_dist = float(np.linalg.norm(color_end - color_start))
-            if endpoint_dist < 12.0:
+            _edist_thresh = 5.0 if _is_achromatic_grad else 12.0
+            if endpoint_dist < _edist_thresh:
+                if _dbg_grad:
+                    pass
                 return None
 
             span = max(p_max - p_min, 1e-6)
             t_vals = np.clip((proj_spatial - p_min) / span, 0.0, 1.0)
             color_line = color_start[None, :] + (color_end - color_start)[None, :] * t_vals[:, None]
             fit_residual = float(np.mean(np.linalg.norm(colors - color_line, axis=1)))
-            if fit_residual > max(18.0, endpoint_dist * 0.42):
+            _resid_thresh = max(28.0 if _is_large_group else 18.0, endpoint_dist * (0.60 if _is_large_group else 0.42))
+            if fit_residual > _resid_thresh:
+                if _dbg_grad:
+                    pass
                 return None
+            if _dbg_grad:
+                pass
 
             mid_mask = (t_vals >= 0.35) & (t_vals <= 0.65)
             color_mid_hex = None
@@ -2211,7 +2306,7 @@ def multilevel_vectorize(
             return f"url(#{gid})"
 
         def _extract_group_detail_overlays(group: list[int], group_area: float) -> list[tuple[str, str]]:
-            if _sat_frac <= 0.25 or cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.012:
+            if cluster_is_thin[cluster_idx] or group_area < total_pixels * 0.003:
                 return []
 
             _cluster_sat = int(centers_hsv_render[cluster_idx, 1])
@@ -2312,6 +2407,7 @@ def multilevel_vectorize(
                             continue
                         contour[:, 0] += x0
                         contour[:, 1] += y0
+                        contour = _collapse_staircase_runs_closed(contour)
                         contour = _smooth_contour(contour, sigma=max(0.8, 0.28 * S))
                         d_detail = _fit_contour(
                             contour,
@@ -2339,6 +2435,8 @@ def multilevel_vectorize(
         # Each group becomes one SVG path (outer + holes = evenodd cutouts)
         cluster_fill_ref = gradient_fill_map.get(cluster_idx)
         group_gradient_scores: list[tuple[float, str]] = []
+        _t_overlay_start = time.time()
+        _OVERLAY_BUDGET = 6.0  # max seconds per cluster for tonal sub-overlays
         for group, group_parts, group_bbox, probe_pts, group_area in zip(
             _contour_groups,
             core_parts_per_group,
@@ -2370,12 +2468,13 @@ def multilevel_vectorize(
             _local_paths += 1
             _local_nodes += combined.count("C") + combined.count("L") + combined.count("M")
 
-            for detail_path, detail_fill in _extract_group_detail_overlays(group, group_area):
-                layer_paths.append(detail_path)
-                layer_opacities.append(1.0)
-                layer_path_fills.append(detail_fill)
-                _local_paths += 1
-                _local_nodes += detail_path.count("C") + detail_path.count("L") + detail_path.count("M")
+            if time.time() - _t_overlay_start < _OVERLAY_BUDGET:
+                for detail_path, detail_fill in _extract_group_detail_overlays(group, group_area):
+                    layer_paths.append(detail_path)
+                    layer_opacities.append(1.0)
+                    layer_path_fills.append(detail_fill)
+                    _local_paths += 1
+                    _local_nodes += detail_path.count("C") + detail_path.count("L") + detail_path.count("M")
 
         if cluster_gradient_regions and layer_path_fills and not any(fill.startswith("url(#") for fill in layer_path_fills):
             _best_group_idx = -1
@@ -2541,16 +2640,42 @@ def multilevel_vectorize(
                 if _dk_dark_n < 10:  # lowered from 50: sparse ink clusters still matter
                     continue
             # Build binary mask of dark pixels in this cluster
-            _dk_bin = _dk_dark_pixel_mask.reshape(h, w).astype(np.uint8)
+            _dk_seed = _dk_dark_pixel_mask.reshape(h, w).astype(np.uint8)
             # For light clusters use a larger CLOSE kernel to connect nearby
             # scattered short segments (e.g. fine botanical ink endpoints) into
             # blobs large enough to pass the area filter.  Dark cluster boundary
             # zone uses the smaller kernel to stay faithful to thin features.
-            _dk_close_kern = _morph_ell if _dk_is_dark_cluster else _morph_ell_lg
             _dk_area_min = 5 if _dk_is_dark_cluster else 3
-            _dk_bin = cv2.morphologyEx(_dk_bin, cv2.MORPH_CLOSE, _dk_close_kern, iterations=2)
-            if not cluster_is_thin[_dk]:
-                _dk_bin = cv2.dilate(_dk_bin, _morph_ell, iterations=1)
+            if _dk_is_dark_cluster:
+                _dk_bin = cv2.morphologyEx(_dk_seed, cv2.MORPH_CLOSE, _morph_ell, iterations=2)
+                if not cluster_is_thin[_dk]:
+                    _dk_bin = cv2.dilate(_dk_bin, _morph_ell, iterations=1)
+            else:
+                _dk_bin_fast = cv2.morphologyEx(_dk_seed, cv2.MORPH_CLOSE, _morph_ell_lg, iterations=2)
+                if not cluster_is_thin[_dk]:
+                    _dk_bin_fast = cv2.dilate(_dk_bin_fast, _morph_ell, iterations=1)
+                _dk_mask_px = int(_dk_mask.sum())
+                _fast_n = int(cv2.countNonZero(_dk_bin_fast))
+                _dk_cluster_sat = int(centers_hsv_render[_dk, 1])
+                if _sat_frac < 0.15 or _dk_cluster_sat < 30:
+                    _growth_mult = 1.6
+                    _growth_add = 4000
+                elif _sat_frac > 0.77:
+                    _growth_mult = 2.5
+                    _growth_add = 12000
+                else:
+                    _growth_mult = 3.6
+                    _growth_add = 22000
+                _use_component_close = (
+                    (_dk_mask_px > int(h * w * 0.01) or _dk_dark_n > 4000)
+                    and _fast_n > max(int(_dk_dark_n * _growth_mult), _dk_dark_n + _growth_add)
+                )
+                if _use_component_close:
+                    _dk_bin = cv2.morphologyEx(_dk_seed, cv2.MORPH_CLOSE, _morph_ell, iterations=1)
+                    if not cluster_is_thin[_dk] and not (_sat_frac < 0.15 or _dk_cluster_sat < 30):
+                        _dk_bin = cv2.dilate(_dk_bin, _morph_ell, iterations=1)
+                else:
+                    _dk_bin = _dk_bin_fast
             if cv2.countNonZero(_dk_bin) < 30:
                 continue
             # Extract contours with CCOMP hierarchy so inner holes (e.g. interior
@@ -2600,8 +2725,6 @@ def multilevel_vectorize(
                 if _cluster_debug:
                     _dk_frac = _dk_dark_n / max(1, int(_dk_mask.sum()))
                     kind = "dark-cluster-bz" if _dk_is_dark_cluster else "light-cluster"
-                    print(f"[CLUSTER] dark-overlay({kind}): k{_dk} rc_gray={_rc_gray} "
-                          f"dark_frac={_dk_frac:.3f} dark_n={_dk_dark_n}")
 
     return MultilevelResult(
         layers=layers,
@@ -2619,6 +2742,17 @@ def multilevel_vectorize(
 # ---------------------------------------------------------------------------
 # SVG generation
 # ---------------------------------------------------------------------------
+
+def _is_achromatic_midtone(hex_color: str) -> bool:
+    """Return True for near-grey colours in the mid-luminance range (not black/white)."""
+    try:
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+    except (ValueError, IndexError):
+        return False
+    return (max(r, g, b) - min(r, g, b) < 32) and (65 < (r + g + b) // 3 < 215)
+
 
 def generate_svg(
     result: MultilevelResult,
@@ -3218,7 +3352,6 @@ def _detect_gradients(
                 break
 
     if _diag:
-        print(f"[GRAD] candidates pair={_diag_counts['pair_candidates']} single={_diag_counts['single_candidates']} accept pair={_diag_counts['pair_accept']} single={_diag_counts['single_accept']}")
         print(
             "[GRAD] rejects "
             f"small={_diag_counts['reject_small']} spread={_diag_counts['reject_spread']} "
@@ -3230,18 +3363,14 @@ def _detect_gradients(
         )
         if _diag_corr_samples:
             _diag_corr_samples.sort(key=lambda item: abs(item[2]), reverse=True)
-            print("[GRAD] corr samples " + ", ".join(
-                f"seed={seed}:px={pix}:corr={corr:.3f}"
-                for seed, pix, corr in _diag_corr_samples[:8]
-            ))
         if _diag_accept_regions:
-            print("[GRAD] accepted " + " | ".join(_diag_accept_regions))
+            pass
         if _diag_component_candidates:
-            print("[GRAD] warm components " + " | ".join(_diag_component_candidates))
+            pass
         if _diag_reject_regions:
-            print("[GRAD] rejected regions " + " | ".join(_diag_reject_regions))
+            pass
         if _diag_radial_regions:
-            print("[GRAD] radial regions " + " | ".join(_diag_radial_regions))
+            pass
 
     # --- Multi-cluster gradient chain detection ---
     # When multiple adjacent clusters each have individual gradients and share
@@ -3323,7 +3452,7 @@ def _detect_gradients(
                     _chain_dbg.append(f"{_ck1},{_ck2}:UNION(adj={_adj_count})")
                 _uf_union(_ck1, _ck2)
         if _diag and _chain_dbg:
-            print("[CHAIN_DBG] " + " | ".join(_chain_dbg[:30]))
+            pass
 
         # Collect groups
         _cgroups: dict[int, list[int]] = {}
@@ -3353,7 +3482,7 @@ def _detect_gradients(
                 _chain_key = f"chain:{sorted(_cgmembers)}"
                 _chain_why = [r for r in _diag_reject_regions if _chain_key in r]
                 if _diag:
-                    print(f"[CHAIN_REJECT] {_chain_key} → {_chain_why}")
+                    pass
                 continue
             gradient_defs.append(_cgd)
             _chain_fill = f"url(#{_cgd.id})"
@@ -3363,7 +3492,7 @@ def _detect_gradients(
             _chain_accept.append(f"chain:{sorted(_cgmembers)}:{_cgd.kind}")
 
         if _diag and _chain_accept:
-            print("[GRAD] chains " + " | ".join(_chain_accept))
+            pass
 
 
 def _gradient_aware_merge(
@@ -3437,21 +3566,60 @@ def _gradient_aware_merge(
         mean_diffs[nonzero] = diff_sums[nonzero] / diff_counts[nonzero]
 
         # Find candidate: low boundary contrast + moderate cluster distance
-        # + boundary must be substantial (>0.5% of image) to avoid merging
-        # small distinct color regions that happen to have smooth transitions.
+        # + boundary must be substantial to avoid merging small distinct color
+        # regions that happen to have smooth transitions.
+        # Achromatic pairs use a much smaller minimum (narrow gray bands have
+        # only ~line-width boundary pixels, not the full 0.5% area budget).
         min_boundary = int(h * w * 0.005)
-        cand_mask = ((diff_counts >= min_boundary)
-                     & (mean_diffs < boundary_contrast_thresh))
+        min_boundary_achro = max(50, int(h * w * 0.00005))  # 0.005% for gray bands
+        cand_mask = ((diff_counts >= min_boundary_achro)
+                     & (mean_diffs < boundary_contrast_thresh * 4.0))
         best = None
-        best_contrast = boundary_contrast_thresh
+        best_contrast = boundary_contrast_thresh * 3.5
         for key in np.where(cand_mask)[0]:
             k1, k2 = divmod(int(key), K)
             if not alive[k1] or not alive[k2]:
                 continue
+            _achro_k1 = float(np.max(centers[k1]) - np.min(centers[k1])) < 30.0
+            _achro_k2 = float(np.max(centers[k2]) - np.min(centers[k2])) < 30.0
+            _lum_k1 = float(np.mean(centers[k1]))
+            _lum_k2 = float(np.mean(centers[k2]))
+            # Only relax thresholds for LIGHT achromatic pairs (car-body highlights etc.)
+            # Dark clusters (glass, shadows, near-black) keep strict normal thresholds.
+            _is_light_achro = _achro_k1 and _achro_k2 and _lum_k1 > 110 and _lum_k2 > 110
+            # Dark pair protection: two clusters both in the dark range (lum < 85) can
+            # look distinctly different in context even if their centroids are only
+            # 35-55 BGR units apart (e.g. alcove ceiling vs deep shadow). Halve the
+            # color-distance budget so they cannot be inadvertently merged.
+            _is_dark_pair = _lum_k1 < 85.0 and _lum_k2 < 85.0
+            # bg_cluster is excluded from merges to protect background composition,
+            # EXCEPT when both clusters are light achromatic (e.g. gray-band steps on
+            # a white car fender where bg detection landed on the wrong cluster).
             if k1 == bg_cluster or k2 == bg_cluster:
+                if not _is_light_achro:
+                    continue
+            _eff_bcthr = boundary_contrast_thresh * (2.0 if _is_light_achro else 1.0)
+            _eff_min_bdry = min_boundary_achro if _is_light_achro else min_boundary
+            if diff_counts[key] < _eff_min_bdry:
                 continue
-            color_dist = float(np.linalg.norm(centers[k1] - centers[k2]))
-            if color_dist >= max_color_dist:
+            if _is_light_achro:
+                pass
+            if mean_diffs[key] >= _eff_bcthr:
+                continue
+            # For achromatic pairs, Euclidean distance inflates by √3 (all 3
+            # BGR channels equal for gray).  Use luminance distance instead so
+            # the threshold is consistent with the physical gray-level gap.
+            if _is_light_achro:
+                color_dist = abs(float(np.mean(centers[k1])) - float(np.mean(centers[k2])))
+            else:
+                color_dist = float(np.linalg.norm(centers[k1] - centers[k2]))
+            if _is_dark_pair:
+                _eff_max_cd = max_color_dist * 0.5   # 30px — dark tones are perceptually distinct despite close centroids
+            elif _is_light_achro:
+                _eff_max_cd = max_color_dist * 1.3
+            else:
+                _eff_max_cd = max_color_dist
+            if color_dist >= _eff_max_cd:
                 continue
             if mean_diffs[key] < best_contrast:
                 best_contrast = mean_diffs[key]
@@ -3465,6 +3633,10 @@ def _gradient_aware_merge(
             src, dst = k2, k1
         else:
             src, dst = k1, k2
+
+        # If the bg_cluster is being absorbed into dst, track the new index.
+        if src == bg_cluster:
+            bg_cluster = dst
 
         w_src, w_dst = float(pixel_counts[src]), float(pixel_counts[dst])
         centers[dst] = (centers[dst] * w_dst + centers[src] * w_src) / (w_src + w_dst)
@@ -3593,6 +3765,112 @@ def _point_to_segment_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float
         return float(np.linalg.norm(p - a))
     t = np.clip(float(np.dot(p - a, ab)) / ab_len_sq, 0.0, 1.0)
     return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def _collapse_staircase_runs_closed(
+    points: np.ndarray,
+    *,
+    max_step: float = 3.5,
+    axis_ratio: float = 0.22,
+) -> np.ndarray:
+    """Collapse short horizontal/vertical stair steps into their diagonal chord.
+
+    Pixel boundaries often encode a smooth diagonal as alternating short
+    horizontal/vertical segments. Keeping those turns forces the fitter to
+    spend control points on raster noise instead of the true edge.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    return pts
+    if len(pts) < 8:
+        return pts
+
+    def _classify_step(delta: np.ndarray) -> tuple[str, int] | None:
+        dx = float(delta[0])
+        dy = float(delta[1])
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-6 or seg_len > max_step:
+            return None
+        if abs(dy) <= max(0.35, seg_len * axis_ratio):
+            return ("h", 1 if dx >= 0.0 else -1)
+        if abs(dx) <= max(0.35, seg_len * axis_ratio):
+            return ("v", 1 if dy >= 0.0 else -1)
+        return None
+
+    def _is_staircase_run(run_pts: np.ndarray, axes: list[str]) -> bool:
+        if len(axes) < 4 or "h" not in axes or "v" not in axes:
+            return False
+        chord = run_pts[-1] - run_pts[0]
+        chord_len = math.hypot(float(chord[0]), float(chord[1]))
+        if chord_len < max_step * 1.75:
+            return False
+        if abs(float(chord[0])) < 1.0 or abs(float(chord[1])) < 1.0:
+            return False
+        if len(run_pts) > 2:
+            rel = run_pts[1:-1] - run_pts[0]
+            cross = np.abs(rel[:, 0] * chord[1] - rel[:, 1] * chord[0])
+            max_dev = float(np.max(cross) / max(chord_len, 1e-6))
+        else:
+            max_dev = 0.0
+        if max_dev > max(1.5, max_step * 1.15):
+            return False
+        if len(run_pts) >= 4:
+            turn_a = run_pts[1:-1] - run_pts[:-2]
+            turn_b = run_pts[2:] - run_pts[1:-1]
+            cross_turn = turn_a[:, 0] * turn_b[:, 1] - turn_a[:, 1] * turn_b[:, 0]
+            nz = np.sign(cross_turn[np.abs(cross_turn) > 1e-6])
+            if len(nz) >= 3:
+                alternating = float(np.mean(nz[:-1] != nz[1:]))
+                if alternating < 0.6:
+                    return False
+        return True
+
+    simplified = [pts[0]]
+    i = 0
+    n = len(pts)
+    while i < n - 1:
+        first_step = _classify_step(pts[i + 1] - pts[i])
+        if first_step is None:
+            simplified.append(pts[i + 1])
+            i += 1
+            continue
+
+        h_sign = first_step[1] if first_step[0] == "h" else 0
+        v_sign = first_step[1] if first_step[0] == "v" else 0
+        axes = [first_step[0]]
+        prev_axis = first_step[0]
+        j = i + 1
+
+        while j < n - 1:
+            next_step = _classify_step(pts[j + 1] - pts[j])
+            if next_step is None or next_step[0] == prev_axis:
+                break
+            axis, sign = next_step
+            if axis == "h":
+                if h_sign == 0:
+                    h_sign = sign
+                elif h_sign != sign:
+                    break
+            else:
+                if v_sign == 0:
+                    v_sign = sign
+                elif v_sign != sign:
+                    break
+            axes.append(axis)
+            prev_axis = axis
+            j += 1
+
+        if j > i + 1 and _is_staircase_run(pts[i:j + 1], axes):
+            simplified.append(pts[j])
+            i = j
+            continue
+
+        simplified.append(pts[i + 1])
+        i += 1
+
+    result = np.array(simplified, dtype=np.float64)
+    if len(result) >= 2 and np.linalg.norm(result[0] - result[-1]) < 1e-6:
+        result = result[:-1]
+    return result if len(result) >= 3 else pts
 
 
 def _smooth_contour(pts: np.ndarray, sigma: float = 3.0, light_mode: bool = False) -> np.ndarray:
@@ -4019,36 +4297,45 @@ def _bgr_to_hex(color) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def _estimate_initial_k(image_bgr: np.ndarray, max_k: int = 12) -> int:
-    """Estimate initial K for K-means from image color complexity.
+def _estimate_initial_k(image_bgr: np.ndarray, max_k: int = 48) -> int:
+    """Estimate K for K-means purely from image color complexity.
 
-    Samples the image in CIELAB space and counts perceptually distinct
-    color bins.  Returns K = n_distinct (merge step handles AA
-    intermediates, so no headroom multiplier is needed).
+    Bins the image in CIELAB at two resolutions:
+      - 15 ΔE (coarse): counts major distinct color regions — the primary K
+      - 8 ΔE (fine) for dark pixels only: dark tones need finer separation
+        because the eye is less forgiving of banding there
+
+    _gradient_aware_merge will collapse any over-split clusters, so it is
+    safe to start high and let the merge step reduce K.
     """
     h, w = image_bgr.shape[:2]
-    scale = max(1, min(h, w) // 64)
+    scale = max(1, min(h, w) // 128)
     small = cv2.resize(image_bgr, (w // scale, h // scale),
                        interpolation=cv2.INTER_AREA)
     lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
-    # Bin at ~8 ΔE resolution
-    binned = (lab / 8.0).astype(np.int32)
-    n_distinct = len(np.unique(binned, axis=0))
-    # Cap K for grayscale/low-saturation images — fewer clusters = larger contiguous regions
+
+    # Major color regions at 15 ΔE — gives meaningful group count for photos
+    n_major = len(np.unique((lab / 15.0).astype(np.int32), axis=0))
+
+    # Extra dark-tone clusters: lum < 60 needs finer separation
+    dark_mask = lab[:, 0] < 60
+    if dark_mask.sum() > 50:
+        dark_lab = lab[dark_mask]
+        n_dark_fine = len(np.unique((dark_lab / 8.0).astype(np.int32), axis=0))
+        n_dark_coarse = len(np.unique((dark_lab / 15.0).astype(np.int32), axis=0))
+        dark_surplus = max(0, n_dark_fine - n_dark_coarse)
+    else:
+        dark_surplus = 0
+
+    n_distinct = n_major + dark_surplus
+
+    # Truly achromatic images (logo, line art) need very few clusters
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    mean_saturation = hsv[:, :, 1].mean()
-    # Check for chromatic content that needs dedicated clusters
-    sat_mask = hsv[:, :, 1] > 40  # pixels with meaningful saturation
-    sat_fraction = sat_mask.sum() / max(1, hsv.shape[0] * hsv.shape[1])
-    # Only cap K for truly achromatic images — if >1% of pixels are
-    # chromatic, they need their own clusters even if the mean is low
+    mean_saturation = float(hsv[:, :, 1].mean())
+    sat_fraction = float((hsv[:, :, 1] > 40).sum()) / max(1, h * w)
     if mean_saturation < 30 and sat_fraction < 0.01:
         max_k = min(max_k, 6)
-    if sat_fraction > 0.005:  # at least 0.5% of pixels are chromatic
-        hue_vals = hsv[:, :, 0][sat_mask]
-        hue_sectors = len(np.unique(hue_vals // 30))  # 30° sectors = 6 sectors max
-        min_chromatic_k = max(4, 3 + hue_sectors)  # 3 for luminance spread + 1 per hue sector
-        n_distinct = max(n_distinct, min_chromatic_k)
+
     return max(4, min(max_k, n_distinct))
 
 
